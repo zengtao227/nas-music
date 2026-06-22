@@ -96,7 +96,40 @@ cd /volume1/docker/cloudflared && sudo /usr/local/bin/docker compose restart
 | 删歌 | Spotify → Downloads 歌单 → Remove（最多 5 分钟后从 NAS 删除） |
 | 听歌 | 打开 Finamp |
 
-## 初始导入（待完成）
+## Spotify sp_dc Cookie 管理
 
-Mia 的 Liked Songs（779 首）还未加入 Downloads 歌单。
-需在 Spotify 桌面版：Liked Songs → Ctrl+A 全选 → Add to playlist → Downloads。
+### 什么是 sp_dc
+Spotify 的浏览器会话 cookie，让 NAS 脚本以 Mia 的身份访问 Liked Songs（无需 Premium）。
+
+### 存储位置
+`/volume1/homes/Mia/Music/.spotify_sp_dc`（NAS，权限 600）
+
+### 有效期与失效条件
+- 正常有效期：1-2 年
+- 提前失效：Mia 退出 Spotify 登录、修改密码
+- 失效后每日检测脚本会发 Telegram 通知
+
+### Cookie 失效后如何更新
+1. 在电脑浏览器打开 [open.spotify.com](https://open.spotify.com)，确保已登录 Mia 的账号
+2. 按 F12 → Application → Cookies → `https://open.spotify.com`
+3. 找到 `sp_dc`，复制其 Value
+4. 在 NAS 上更新（SSH 连接后执行）：
+   ```bash
+   sudo /usr/local/bin/docker run --rm \
+     -v /volume1/homes/Mia/Music:/music \
+     --entrypoint sh \
+     spotdl-local:latest \
+     -c 'echo "新的sp_dc值" > /music/.spotify_sp_dc && chmod 600 /music/.spotify_sp_dc'
+   ```
+5. 更新后等待下次 5 分钟 cron 自动验证
+
+### 每日有效性检测
+`/etc/crontab` 中有一条每日 08:00 运行的检测：读取 `.spotify_sp_dc`，对 Spotify API 发一次请求，失败则发 Telegram 通知。（TODO：脚本待创建）
+
+---
+
+## 初始导入（进行中）
+
+Mia 的 Liked Songs（788 首）正在通过网页版移入 Downloads 歌单。
+当前状态：Downloads 有 496 首，还有 292 首待加入。
+完成后重新运行对比脚本清理多余歌曲。
