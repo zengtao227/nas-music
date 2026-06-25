@@ -96,7 +96,11 @@ def main() -> None:
 
             # Save metadata first so liked.spotdl tracks even already-on-disk songs
             BATCH_FILE.unlink(missing_ok=True)
-            spotdl("save", *urls, "--save-file", str(BATCH_FILE))
+            rc = spotdl("save", *urls, "--save-file", str(BATCH_FILE))
+            if rc != 0 or not BATCH_FILE.exists():
+                print(f"Batch {n}: save failed (rc={rc}), skipping — will retry next run", flush=True)
+                BATCH_FILE.unlink(missing_ok=True)
+                continue
             songs = merge_batch_file(songs)
             write_save_file(songs)
 
