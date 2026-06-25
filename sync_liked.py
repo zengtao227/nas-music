@@ -34,15 +34,16 @@ def get_liked_ids() -> set[str]:
     return ids
 
 
-def load_save_file() -> tuple[dict, set[str]]:
-    """Returns (save_data, set_of_song_ids_in_file)."""
+def load_save_file() -> tuple[list, set[str]]:
+    """Returns (song_list, set_of_song_ids_in_file)."""
     if not SAVE_FILE.exists():
-        return {"type": "sync", "query": "liked-songs", "songs": []}, set()
+        return [], set()
     data = json.loads(SAVE_FILE.read_text())
-    return data, {s["song_id"] for s in data.get("songs", [])}
+    songs: list = data if isinstance(data, list) else data.get("songs", [])
+    return songs, {s["song_id"] for s in songs}
 
 
-def write_save_file(data: dict) -> None:
+def write_save_file(data: list) -> None:
     SAVE_FILE.write_text(json.dumps(data))
 
 
@@ -76,7 +77,7 @@ def main() -> None:
     # Remove unliked songs from save file, then spotdl sync deletes their local files
     if removed_ids:
         save_data, _ = load_save_file()
-        save_data["songs"] = [s for s in save_data["songs"] if s["song_id"] not in removed_ids]
+        save_data = [s for s in save_data if s["song_id"] not in removed_ids]
         write_save_file(save_data)
         print(f"Removed {len(removed_ids)} songs from liked.spotdl", flush=True)
         if SAVE_FILE.exists():
