@@ -15,14 +15,21 @@ import json
 import pathlib
 import subprocess
 
+import mutagen
 import spotapi
 
 MUSIC_DIR = pathlib.Path("/music")
+PLAYLISTS_DIR = MUSIC_DIR / "Playlists"
 SP_DC_FILE = MUSIC_DIR / ".spotify_sp_dc"
 SAVE_FILE = MUSIC_DIR / "liked.spotdl"
 BATCH_FILE = MUSIC_DIR / "liked_batch.spotdl"
 OUTPUT_TEMPLATE = "{artists}/{album}/{title}"
 BATCH_SIZE = 50
+
+# Refuse to delete more than this many files in one run. Real unlikes come a few
+# at a time; hundreds of "removals" means the Spotify snapshot is incomplete
+# (expired cookie / partial pagination), so we skip rather than wipe the library.
+MAX_DELETIONS = 30
 
 
 def get_liked_ids() -> set[str]:
@@ -59,6 +66,38 @@ def write_save_file(songs: list) -> None:
 
 def spotdl(*args: str) -> int:
     return subprocess.run(["spotdl", *args], cwd=str(MUSIC_DIR)).returncode
+
+
+def song_id_from_file(mp3: pathlib.Path) -> str:
+    """Read the Spotify track ID spotDL embeds in the WOAS ID3 frame."""
+    try:
+        tags = mutagen.File(mp3)
+        woas = tags.get("WOAS") if tags else None
+    except Exception:
+        return ""
+    if not woas:
+        return ""
+    return str(woas).rstrip("/").split("/")[-1]
+
+
+def delete_files_for_ids(removed_ids: set[str]) -> int:
+    """Delete liked-song files whose embedded Spotify ID is in removed_ids.
+
+    Scans only the liked-songs area; files under Playlists/ are left alone so a
+    song that is unliked but still in a playlist keeps its playlist copy.
+    """
+    deleted = 0
+    for mp3 in MUSIC_DIR.rglob("*.mp3"):
+        if PLAYLISTS_DIR in mp3.parents:
+            continue
+        if song_id_from_file(mp3) in removed_ids:
+            mp3.unlink()
+            deleted += 1
+            # remove now-empty album/artist folders left behind
+            for parent in (mp3.parent, mp3.parent.parent):
+                if parent != MUSIC_DIR and parent.is_dir() and not any(parent.iterdir()):
+                    parent.rmdir()
+    return deleted
 
 
 def merge_batch_file(existing: list) -> list:
@@ -108,11 +147,21 @@ def main() -> None:
             spotdl("download", *urls, "--output", OUTPUT_TEMPLATE)
 
     # --- remove unliked songs ---
+    # Guard wraps BOTH the DB prune and the file delete: if the count is
+    # implausibly large the snapshot is broken, so we touch nothing and let the
+    # next run recompute from the unchanged DB (transient bad fetch self-heals).
     if removed_ids:
-        songs = [s for s in songs if s.get("song_id") not in removed_ids]
-        write_save_file(songs)
-        print(f"Removed {len(removed_ids)} songs from liked.spotdl", flush=True)
-        spotdl("sync", str(SAVE_FILE), "--output", OUTPUT_TEMPLATE)
+        if len(removed_ids) > MAX_DELETIONS:
+            print(
+                f"WARNING: {len(removed_ids)} removals exceeds limit ({MAX_DELETIONS}) — "
+                "snapshot likely incomplete, skipping deletion this run",
+                flush=True,
+            )
+        else:
+            songs = [s for s in songs if s.get("song_id") not in removed_ids]
+            write_save_file(songs)
+            n = delete_files_for_ids(removed_ids)
+            print(f"Removed {len(removed_ids)} from DB, deleted {n} files", flush=True)
 
     print("Done.", flush=True)
 
