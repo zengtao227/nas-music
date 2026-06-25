@@ -42,13 +42,19 @@ def get_liked_ids() -> set[str]:
 def load_save_file() -> tuple[list, set[str]]:
     if not SAVE_FILE.exists():
         return [], set()
-    data = json.loads(SAVE_FILE.read_text())
+    try:
+        data = json.loads(SAVE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        print("WARNING: liked.spotdl corrupted, starting fresh", flush=True)
+        return [], set()
     songs: list = data if isinstance(data, list) else data.get("songs", [])
     return songs, {s["song_id"] for s in songs if "song_id" in s}
 
 
 def write_save_file(songs: list) -> None:
-    SAVE_FILE.write_text(json.dumps(songs))
+    tmp = SAVE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(songs))
+    tmp.replace(SAVE_FILE)  # atomic rename — never leaves a half-written file
 
 
 def spotdl(*args: str) -> int:
