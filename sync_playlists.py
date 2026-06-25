@@ -131,7 +131,7 @@ def sync_playlist(login: spotapi.Login, pl: dict) -> None:
 
             # Save metadata first so the .spotdl tracks even already-on-disk songs
             batch_file.unlink(missing_ok=True)
-            rc = spotdl("save", *urls, "--save-file", str(batch_file), cwd=folder)
+            rc = spotdl("save", *urls, "--save-file", str(batch_file), cwd=MUSIC_DIR)
             if rc != 0 or not batch_file.exists():
                 print(f"Batch {n}: save failed (rc={rc}), skipping — will retry next run", flush=True)
                 batch_file.unlink(missing_ok=True)
@@ -143,7 +143,9 @@ def sync_playlist(login: spotapi.Login, pl: dict) -> None:
             batch_file.unlink(missing_ok=True)
             write_save_file(save_file, songs)
 
-            spotdl("download", *urls, "--output", output_template, cwd=folder)
+            # cwd=MUSIC_DIR so the "Playlists/{folder}/..." template lands at the
+            # right path; cwd=folder would nest a second Playlists/{folder}/ inside.
+            spotdl("download", *urls, "--output", output_template, cwd=MUSIC_DIR)
 
     # --- remove songs no longer in the playlist ---
     # Guard wraps both prune and delete: an implausibly large count means the
