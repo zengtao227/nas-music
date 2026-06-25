@@ -72,7 +72,9 @@ def sync_playlist(login: spotapi.Login, pl: dict) -> None:
 
     print(f"Current: {len(current_ids)}  New: {len(new_ids)}  Removed: {len(removed_ids)}", flush=True)
 
+    # spotDL --save-file OVERWRITES on each call — use temp file per batch and merge.
     if new_ids:
+        batch_save = save_file.with_suffix(".batch.spotdl")
         id_list = list(new_ids)
         for i in range(0, len(id_list), BATCH_SIZE):
             batch = id_list[i:i + BATCH_SIZE]
@@ -80,8 +82,18 @@ def sync_playlist(login: spotapi.Login, pl: dict) -> None:
             print(f"Batch {i // BATCH_SIZE + 1}: {len(batch)} songs...", flush=True)
             spotdl("download", *urls,
                    "--output", output_template,
-                   "--save-file", str(save_file),
+                   "--save-file", str(batch_save),
                    cwd=folder)
+            if batch_save.exists():
+                raw = json.loads(batch_save.read_text())
+                batch_songs: list = raw if isinstance(raw, list) else raw.get("songs", [])
+                existing = json.loads(save_file.read_text()) if save_file.exists() else []
+                cur: list = existing if isinstance(existing, list) else existing.get("songs", [])
+                known = {s["song_id"] for s in cur}
+                new_entries = [s for s in batch_songs if s["song_id"] not in known]
+                if new_entries:
+                    save_file.write_text(json.dumps(cur + new_entries))
+                batch_save.unlink(missing_ok=True)
 
     if removed_ids and save_file.exists():
         data = json.loads(save_file.read_text())

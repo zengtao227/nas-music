@@ -63,16 +63,26 @@ def main() -> None:
     removed_ids = saved_ids - current_ids
     print(f"New: {len(new_ids)}  Removed: {len(removed_ids)}", flush=True)
 
-    # Download new songs in small batches (each batch = one spotDL call)
-    # spotDL fetches Spotify metadata only for songs in the batch → avoids mass rate-limiting
+    # Download new songs in small batches (each batch = one spotDL call).
+    # spotDL --save-file OVERWRITES on each call (only records the current batch).
+    # We use a temp file per batch and merge immediately so the canonical file accumulates.
     if new_ids:
+        batch_save = SAVE_FILE.with_suffix('.batch.spotdl')
         id_list = list(new_ids)
         for i in range(0, len(id_list), BATCH_SIZE):
             batch = id_list[i:i + BATCH_SIZE]
             urls = [f"https://open.spotify.com/track/{sid}" for sid in batch]
             print(f"Batch {i // BATCH_SIZE + 1}: downloading {len(batch)} songs...", flush=True)
-            # --save-file adds downloaded songs to liked.spotdl for future sync/deletion tracking
-            spotdl("download", *urls, "--output", OUTPUT_TEMPLATE, "--save-file", str(SAVE_FILE))
+            spotdl("download", *urls, "--output", OUTPUT_TEMPLATE, "--save-file", str(batch_save))
+            if batch_save.exists():
+                raw = json.loads(batch_save.read_text())
+                batch_songs: list = raw if isinstance(raw, list) else raw.get("songs", [])
+                save_data, _ = load_save_file()
+                known_ids = {s["song_id"] for s in save_data}
+                new_entries = [s for s in batch_songs if s["song_id"] not in known_ids]
+                if new_entries:
+                    write_save_file(save_data + new_entries)
+                batch_save.unlink(missing_ok=True)
 
     # Remove unliked songs from save file, then spotdl sync deletes their local files
     if removed_ids:
