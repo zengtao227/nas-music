@@ -123,7 +123,7 @@ def sync_playlist(login: spotapi.Login, pl: dict) -> None:
     # will be far smaller than saved_ids. The MAX_DELETIONS guard protects deletion,
     # but an incomplete snapshot would also silently skip adding songs already on the
     # server. Skip the entire run rather than operate on a broken snapshot.
-    if saved_ids and len(current_ids) < max(5, int(0.5 * len(saved_ids))):
+    if saved_ids and len(current_ids) < int(0.5 * len(saved_ids)):
         print(
             f"WARNING: snapshot too small ({len(current_ids)} vs {len(saved_ids)} saved) — "
             "possible pagination failure, skipping this run",

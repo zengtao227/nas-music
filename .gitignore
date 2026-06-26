@@ -1,4 +1,5 @@
 missing_ids.json
+youtube_fallback_cache.json
 *.tmp
 .resolver_test.log
 .resolver_live.log

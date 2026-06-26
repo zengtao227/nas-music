@@ -211,10 +211,16 @@ def resolve_url(
 # ---------------------------------------------------------------------------
 def main() -> None:
     dry_run = "--dry-run" in sys.argv
+    ids_filter: set[str] | None = None
+    for arg in sys.argv[1:]:
+        if arg.startswith("--ids="):
+            ids_filter = set(arg.split("=", 1)[1].split(","))
 
     print("=== Fallback Resolver (pure resolver — no downloads) ===", flush=True)
     if dry_run:
         print("[DRY RUN — cache will not be written]", flush=True)
+    if ids_filter:
+        print(f"[FILTER] processing {len(ids_filter)} specified IDs only", flush=True)
 
     # 1. Read missing_ids.json (produced by sync_liked.py)
     if not MISSING_IDS_FILE.exists():
@@ -228,6 +234,12 @@ def main() -> None:
     if not isinstance(missing_ids, list) or not missing_ids:
         print("No missing IDs found in missing_ids.json. Nothing to resolve.", flush=True)
         return
+
+    if ids_filter:
+        missing_ids = [sid for sid in missing_ids if sid in ids_filter]
+        if not missing_ids:
+            print("No specified IDs found in missing_ids.json.", flush=True)
+            return
 
     print(f"Missing IDs to resolve: {len(missing_ids)}", flush=True)
 

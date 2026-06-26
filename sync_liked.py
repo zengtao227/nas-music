@@ -274,7 +274,12 @@ def resolve_path_collisions(
     return satisfied
 
 
-def get_liked_ids() -> set[str]:
+def get_liked_ids() -> tuple[set[str], bool]:
+    """Fetch liked song IDs from Spotify.
+
+    Returns (ids, total_count_absent) where total_count_absent=True means Spotify
+    did not include totalCount in the response (caller should apply heuristic guard).
+    """
     sp_dc = SP_DC_FILE.read_text().strip()
     cfg = spotapi.Config(logger=spotapi.NoopLogger())
     dump = {"identifier": "mia", "password": "", "cookies": {"sp_dc": sp_dc}}
@@ -296,13 +301,13 @@ def get_liked_ids() -> set[str]:
     # was interrupted (network cut, API bug, spotapi parsing failure). Raise so
     # the caller aborts the run — prevents spurious removals on a partial snapshot.
     if declared_total is None:
-        print("WARNING: Spotify did not return totalCount — integrity check skipped", flush=True)
+        print("WARNING: Spotify did not return totalCount — heuristic guard active", flush=True)
     elif len(ids) < declared_total:
         raise RuntimeError(
             f"Incomplete Spotify fetch: got {len(ids)}, declared {declared_total} "
             "— aborting to prevent spurious deletions"
         )
-    return ids
+    return ids, declared_total is None
 
 
 def load_save_file() -> tuple[list, set[str]]:
@@ -413,18 +418,18 @@ def main() -> None:
     print("=== Liked Songs Sync ===", flush=True)
 
     try:
-        current_ids = get_liked_ids()
+        current_ids, total_count_absent = get_liked_ids()
     except RuntimeError as exc:
         print(f"ABORT: {exc}", flush=True)
         return
     print(f"Spotify liked: {len(current_ids)}", flush=True)
 
     songs, saved_ids = load_save_file()
-    # WHY: totalCount missing means we can't compare against Spotify's declared count.
-    # This proportional guard catches truncated pagination even without totalCount:
-    # if Spotify returns < 80% of what we already had, the snapshot is incomplete.
-    # Fail-closed here rather than risk spurious deletions on a partial snapshot.
-    if saved_ids and len(current_ids) < int(0.8 * len(saved_ids)):
+    # WHY: only apply heuristic guard when totalCount was absent.  When Spotify
+    # returned totalCount, get_liked_ids() already verified completeness via the
+    # declared count — applying a second 80% check would reject legitimate large
+    # unlikes (e.g. Mia removes 25% of her library in one go).
+    if total_count_absent and saved_ids and len(current_ids) < int(0.8 * len(saved_ids)):
         print(
             f"WARNING: liked snapshot too small ({len(current_ids)} vs {len(saved_ids)} saved) — "
             "possible pagination failure, aborting",
