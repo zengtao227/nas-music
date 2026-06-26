@@ -198,3 +198,7 @@ def main() -> None:
             print(f"Removed {len(removed_ids)} songs, deleted {n} files", flush=True)
 
     print("Done.", flush=True)
+
+
+if __name__ == "__main__":
+    main()
