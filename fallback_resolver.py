@@ -90,7 +90,11 @@ def search_youtube_candidates(query: str) -> list[dict]:
         "--ignore-errors",
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # check=False: yt-dlp may exit non-zero for partial results or minor
+        # errors (geo-restrictions, one unavailable video) while still returning
+        # valid JSON lines on stdout.  We parse what we get; truly empty output
+        # is handled by the empty-candidates return path below.
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
         candidates = []
         for line in res.stdout.strip().split("\n"):
             if not line:
@@ -107,6 +111,8 @@ def search_youtube_candidates(query: str) -> list[dict]:
                 })
             except json.JSONDecodeError:
                 continue
+        if not candidates and res.returncode != 0:
+            print(f"  ⚠️  yt-dlp returned no results (rc={res.returncode}) for '{query}'", flush=True)
         return candidates
     except Exception as exc:
         print(f"  ⚠️  yt-dlp search failed for '{query}': {exc}", flush=True)

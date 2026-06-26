@@ -16,6 +16,7 @@ import json
 import pathlib
 import subprocess
 import time
+from collections import defaultdict
 
 import mutagen
 import mutagen.id3
@@ -118,8 +119,34 @@ def build_local_id_to_path() -> dict[str, pathlib.Path]:
     return result
 
 
+def build_collision_groups(songs: list[dict]) -> dict[str, list[str]]:
+    """Map stable path key → sorted sibling IDs for all collision groups.
+
+    A collision group exists when 2+ liked songs share the same deterministic
+    filesystem path (same artist/album/title metadata).  The key is normalised
+    (lowercase, stripped) for stability across minor metadata variations.
+    Sorting IDs ensures [0] is always the canonical owner on every replay.
+    """
+    path_map: defaultdict[str, list[str]] = defaultdict(list)
+    for s in songs:
+        if "song_id" not in s:
+            continue
+        artists = s.get("artists") or []
+        artist_str = ", ".join(artists) if artists else (s.get("artist") or "")
+        album = (s.get("album_name") or "").strip()
+        title = (s.get("name") or "").strip()
+        if not (artist_str and title):
+            continue
+        key = f"{artist_str.lower().strip()}::{album.lower()}::{title.lower()}"
+        path_map[key].append(s["song_id"])
+    return {k: sorted(v) for k, v in path_map.items() if len(v) > 1}
+
+
 def cleanup_stale_conflicts(
-    missing_ids: set[str], songs: list[dict], liked_ids_all: set[str]
+    missing_ids: set[str],
+    songs: list[dict],
+    liked_ids_all: set[str],
+    id_to_canonical_owner: dict[str, str],
 ) -> None:
     """Remove stale-WOAS placeholder files that would cause spotdl to skip a download.
 
@@ -129,17 +156,12 @@ def cleanup_stale_conflicts(
     the new ID.  spotdl sees the file → skips → new ID never lands → infinite
     cron loop.
 
-    Strategy: use liked.spotdl (authoritative) + OUTPUT_TEMPLATE (deterministic)
-    to compute the exact path spotdl would write.  If that path already exists
-    AND its WOAS tag differs from the target Spotify ID, the file is a stale
-    placeholder → delete it so the next spotdl call can land the correct asset.
-
-    Identity key: WOAS only.  No fuzzy matching, no ISRC, no artist/title join.
-
-    Guard: if the occupying file's WOAS is also a liked song, this is a path
-    collision (two liked songs share the same deterministic path due to identical
-    artist/album/title metadata).  Do NOT delete — deleting would create an
-    infinite clean-download cycle between the two collision siblings.
+    Ownership rule (deterministic):
+    - Canonical owner of a collision group = min(sorted sibling IDs).
+    - A file whose WOAS IS the canonical owner → keep (correct long-term file).
+    - A file whose WOAS is a non-owner sibling → delete (let owner replace it).
+    - A file whose WOAS is a unique liked song (no collision group) → keep.
+    - A file whose WOAS is not liked → delete (true stale).
     """
     id_to_meta: dict[str, dict] = {s["song_id"]: s for s in songs if "song_id" in s}
 
@@ -148,7 +170,6 @@ def cleanup_stale_conflicts(
         if not meta:
             continue
 
-        # Deterministic path computation — same template spotdl uses.
         artists = meta.get("artists") or []
         artist_str = ", ".join(artists) if artists else (meta.get("artist") or "")
         album = meta.get("album_name") or ""
@@ -166,19 +187,24 @@ def cleanup_stale_conflicts(
                 continue
             woas = tags.get("WOAS")
             current_id = str(woas).rstrip("/").split("/")[-1] if woas else None
-            # Guard: only delete when WOAS is present and explicitly mismatches.
-            # No WOAS → file was not downloaded by this system → leave untouched.
-            if current_id and current_id != sid:
-                if current_id in liked_ids_all:
-                    # Path collision: occupying file belongs to another liked song.
-                    # resolve_path_collisions() will handle this as collision-satisfied.
-                    continue
-                print(
-                    f"[CLEAN] stale placeholder removed: {expected.name}"
-                    f" (WOAS={current_id}, want={sid})",
-                    flush=True,
-                )
-                expected.unlink()
+            if not (current_id and current_id != sid):
+                continue
+
+            canonical_of_current = id_to_canonical_owner.get(current_id)
+            is_canonical_owner = canonical_of_current == current_id
+            # Unique liked song: in liked_ids_all but has no collision group.
+            is_unique_liked = current_id in liked_ids_all and current_id not in id_to_canonical_owner
+
+            if is_canonical_owner or is_unique_liked:
+                continue
+
+            label = "non-owner sibling" if current_id in liked_ids_all else "stale"
+            print(
+                f"[CLEAN] {label} removed: {expected.name}"
+                f" (WOAS={current_id}, want={sid})",
+                flush=True,
+            )
+            expected.unlink()
         except Exception:
             continue
 
@@ -201,65 +227,29 @@ def _log_collision_decision(
 
 
 def resolve_path_collisions(
-    missing_ids: set[str], songs: list[dict], liked_ids_all: set[str]
+    missing_ids: set[str], songs: list[dict]
 ) -> set[str]:
-    """Return IDs satisfied by a collision-sibling already on disk.
+    """Return non-owner IDs that are always collision-satisfied (never downloaded).
 
-    When multiple liked songs share the same deterministic path (identical
-    artist/album/title metadata), only one file can exist at that path.
-    If a liked song already occupies the path (WOAS ∈ liked_ids_all), the
-    remaining sibling IDs are collision-satisfied — same audio, no separate
-    download needed.
-
-    Each resolution decision is appended to COLLISION_AUDIT_FILE (.jsonl) so
-    the owner selection is fully auditable across runs.
+    Ownership is deterministic: min(sorted sibling IDs) is the canonical owner.
+    Non-owner IDs are satisfied regardless of filesystem state, so behaviour is
+    identical on every replay.  Each decision is appended to COLLISION_AUDIT_FILE.
     """
-    id_to_meta: dict[str, dict] = {s["song_id"]: s for s in songs if "song_id" in s}
-    satisfied: set[str] = set()
-    # group_key → {owner_id, competing_ids} for audit log batching
-    decisions: dict[str, dict] = {}
+    collision_groups = build_collision_groups(songs)
+    non_owner_ids: set[str] = {sid for ids in collision_groups.values() for sid in ids[1:]}
+    satisfied = missing_ids & non_owner_ids
 
-    for sid in missing_ids:
-        meta = id_to_meta.get(sid)
-        if not meta:
-            continue
-        artists = meta.get("artists") or []
-        artist_str = ", ".join(artists) if artists else (meta.get("artist") or "")
-        album = meta.get("album_name") or ""
-        title = meta.get("name") or ""
-        if not (artist_str and title):
-            continue
-
-        expected: pathlib.Path = MUSIC_DIR / artist_str / album / f"{title}.mp3"
-        if not expected.exists():
-            continue
-
-        try:
-            tags = mutagen.File(expected)
-            if not tags:
-                continue
-            woas = tags.get("WOAS")
-            occupying_id = str(woas).rstrip("/").split("/")[-1] if woas else None
-            if occupying_id and occupying_id != sid and occupying_id in liked_ids_all:
-                satisfied.add(sid)
-                group_key = f"{artist_str}/{album}/{title}"
-                if group_key not in decisions:
-                    decisions[group_key] = {"owner_id": occupying_id, "competing_ids": []}
-                decisions[group_key]["competing_ids"].append(sid)
+    for group_key, group_ids in collision_groups.items():
+        owner = group_ids[0]
+        competing = sorted(set(group_ids[1:]) & missing_ids)
+        if competing:
+            _log_collision_decision(group_key, owner, competing, "deterministic_min_id")
+            title = group_key.split("::")[-1]
+            for sid in competing:
                 print(
-                    f"[COLLISION] {title} ({sid}) satisfied by sibling {occupying_id}",
+                    f"[COLLISION] {title} ({sid}) non-owner, canonical={owner}",
                     flush=True,
                 )
-        except Exception:
-            continue
-
-    for group_key, info in decisions.items():
-        _log_collision_decision(
-            group=group_key,
-            owner_id=info["owner_id"],
-            competing_ids=info["competing_ids"],
-            reason="runtime_first_seen",
-        )
 
     return satisfied
 
@@ -481,16 +471,23 @@ def main() -> None:
     liked_ids_all = {s["song_id"] for s in songs if "song_id" in s}
     missing_ids = liked_ids_all - local_ids_after_sync
 
-    # WHY: before invoking spotdl, remove any stale-WOAS placeholder files
-    # that would cause spotdl to skip the download (it deduplicates by filename,
-    # not by Spotify ID).  cleanup_stale_conflicts computes the expected path
-    # deterministically from liked.spotdl + OUTPUT_TEMPLATE and removes only
-    # files whose WOAS explicitly mismatches the target Spotify ID AND whose
-    # occupying WOAS is not also a liked song (path collision guard).
-    cleanup_stale_conflicts(missing_ids, songs, liked_ids_all)
+    # Build collision groups once — shared by cleanup and fallback filter.
+    # id_to_canonical_owner: every ID in a collision group → its canonical owner (min sorted ID).
+    collision_groups = build_collision_groups(songs)
+    id_to_canonical_owner: dict[str, str] = {
+        sid: ids[0] for ids in collision_groups.values() for sid in ids
+    }
+    non_owner_ids: set[str] = {sid for ids in collision_groups.values() for sid in ids[1:]}
+
+    # WHY: remove stale-WOAS placeholders that cause spotdl to skip downloads.
+    # With deterministic ownership, non-owner siblings are also removed to let
+    # the canonical owner's file land at the shared path.
+    cleanup_stale_conflicts(missing_ids, songs, liked_ids_all, id_to_canonical_owner)
 
     fallback_map = load_fallback_map()
-    resolved = {sid: fallback_map[sid] for sid in missing_ids if sid in fallback_map}
+    # Non-owners are never downloaded — canonical owner represents the entire group.
+    download_candidates = missing_ids - non_owner_ids
+    resolved = {sid: fallback_map[sid] for sid in download_candidates if sid in fallback_map}
 
     if resolved:
         print(f"Fallback: {len(resolved)} pre-resolved URLs found, attempting hybrid download", flush=True)
@@ -498,19 +495,15 @@ def main() -> None:
             spotify_url = f"https://open.spotify.com/track/{sid}"
             rc = spotdl("download", f"{yt_url}|{spotify_url}", "--output", OUTPUT_TEMPLATE)
             if rc != 0:
-                # WHY: log failure explicitly so the log file is the audit trail.
-                # The song remains in missing_ids.json and will be retried on the
-                # next cron cycle — no separate retry queue is needed.
                 print(f"  ⚠️  Fallback FAILED (rc={rc}): {sid} — {yt_url}", flush=True)
 
     # Write missing_ids.json snapshot (still-missing after all paths)
     local_ids_final = scan_local_spotify_ids()
     truly_missing = liked_ids_all - local_ids_final
-    # Exclude IDs whose expected path is already served by a collision sibling.
-    collision_satisfied = resolve_path_collisions(truly_missing, songs, liked_ids_all)
+    collision_satisfied = resolve_path_collisions(truly_missing, songs)
     still_missing = list(truly_missing - collision_satisfied)
     if collision_satisfied:
-        print(f"Collision-satisfied: {len(collision_satisfied)} IDs covered by path siblings", flush=True)
+        print(f"Collision-satisfied: {len(collision_satisfied)} IDs covered by canonical owners", flush=True)
     tmp = MISSING_IDS_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(still_missing))
     tmp.replace(MISSING_IDS_FILE)
