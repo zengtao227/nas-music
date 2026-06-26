@@ -264,7 +264,7 @@ def main() -> None:
         else:
             failed_count += 1
 
-    print(f"\n=== Resolver Summary ===", flush=True)
+    print("\n=== Resolver Summary ===", flush=True)
     print(f"Resolved  : {resolved_count}", flush=True)
     print(f"Skipped   : {skipped_count} (valid cache)", flush=True)
     print(f"Failed    : {failed_count}", flush=True)

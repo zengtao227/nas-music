@@ -117,7 +117,7 @@ def build_local_id_to_path() -> dict[str, pathlib.Path]:
 
 
 def cleanup_stale_conflicts(
-    missing_ids: set[str], songs: list[dict]
+    missing_ids: set[str], songs: list[dict], liked_ids_all: set[str]
 ) -> None:
     """Remove stale-WOAS placeholder files that would cause spotdl to skip a download.
 
@@ -133,6 +133,11 @@ def cleanup_stale_conflicts(
     placeholder → delete it so the next spotdl call can land the correct asset.
 
     Identity key: WOAS only.  No fuzzy matching, no ISRC, no artist/title join.
+
+    Guard: if the occupying file's WOAS is also a liked song, this is a path
+    collision (two liked songs share the same deterministic path due to identical
+    artist/album/title metadata).  Do NOT delete — deleting would create an
+    infinite clean-download cycle between the two collision siblings.
     """
     id_to_meta: dict[str, dict] = {s["song_id"]: s for s in songs if "song_id" in s}
 
@@ -162,6 +167,10 @@ def cleanup_stale_conflicts(
             # Guard: only delete when WOAS is present and explicitly mismatches.
             # No WOAS → file was not downloaded by this system → leave untouched.
             if current_id and current_id != sid:
+                if current_id in liked_ids_all:
+                    # Path collision: occupying file belongs to another liked song.
+                    # resolve_path_collisions() will handle this as collision-satisfied.
+                    continue
                 print(
                     f"[CLEAN] stale placeholder removed: {expected.name}"
                     f" (WOAS={current_id}, want={sid})",
@@ -170,6 +179,53 @@ def cleanup_stale_conflicts(
                 expected.unlink()
         except Exception:
             continue
+
+
+def resolve_path_collisions(
+    missing_ids: set[str], songs: list[dict], liked_ids_all: set[str]
+) -> set[str]:
+    """Return IDs satisfied by a collision-sibling already on disk.
+
+    When multiple liked songs share the same deterministic path (identical
+    artist/album/title metadata), only one file can exist at that path.
+    If a liked song already occupies the path (WOAS ∈ liked_ids_all), the
+    remaining sibling IDs are collision-satisfied — same audio, no separate
+    download needed.
+    """
+    id_to_meta: dict[str, dict] = {s["song_id"]: s for s in songs if "song_id" in s}
+    satisfied: set[str] = set()
+
+    for sid in missing_ids:
+        meta = id_to_meta.get(sid)
+        if not meta:
+            continue
+        artists = meta.get("artists") or []
+        artist_str = ", ".join(artists) if artists else (meta.get("artist") or "")
+        album = meta.get("album_name") or ""
+        title = meta.get("name") or ""
+        if not (artist_str and title):
+            continue
+
+        expected: pathlib.Path = MUSIC_DIR / artist_str / album / f"{title}.mp3"
+        if not expected.exists():
+            continue
+
+        try:
+            tags = mutagen.File(expected)
+            if not tags:
+                continue
+            woas = tags.get("WOAS")
+            occupying_id = str(woas).rstrip("/").split("/")[-1] if woas else None
+            if occupying_id and occupying_id != sid and occupying_id in liked_ids_all:
+                satisfied.add(sid)
+                print(
+                    f"[COLLISION] {title} ({sid}) satisfied by sibling {occupying_id}",
+                    flush=True,
+                )
+        except Exception:
+            continue
+
+    return satisfied
 
 
 def load_local_ids_cached() -> set[str]:
@@ -393,8 +449,9 @@ def main() -> None:
     # that would cause spotdl to skip the download (it deduplicates by filename,
     # not by Spotify ID).  cleanup_stale_conflicts computes the expected path
     # deterministically from liked.spotdl + OUTPUT_TEMPLATE and removes only
-    # files whose WOAS explicitly mismatches the target Spotify ID.
-    cleanup_stale_conflicts(missing_ids, songs)
+    # files whose WOAS explicitly mismatches the target Spotify ID AND whose
+    # occupying WOAS is not also a liked song (path collision guard).
+    cleanup_stale_conflicts(missing_ids, songs, liked_ids_all)
 
     fallback_map = load_fallback_map()
     resolved = {sid: fallback_map[sid] for sid in missing_ids if sid in fallback_map}
@@ -412,7 +469,12 @@ def main() -> None:
 
     # Write missing_ids.json snapshot (still-missing after all paths)
     local_ids_final = scan_local_spotify_ids()
-    still_missing = list(liked_ids_all - local_ids_final)
+    truly_missing = liked_ids_all - local_ids_final
+    # Exclude IDs whose expected path is already served by a collision sibling.
+    collision_satisfied = resolve_path_collisions(truly_missing, songs, liked_ids_all)
+    still_missing = list(truly_missing - collision_satisfied)
+    if collision_satisfied:
+        print(f"Collision-satisfied: {len(collision_satisfied)} IDs covered by path siblings", flush=True)
     tmp = MISSING_IDS_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(still_missing))
     tmp.replace(MISSING_IDS_FILE)
