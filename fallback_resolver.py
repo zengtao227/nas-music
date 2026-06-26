@@ -116,10 +116,26 @@ def search_youtube_candidates(query: str) -> list[dict]:
 def score_candidate(
     candidate: dict, spotify_title: str, spotify_duration: float
 ) -> float:
-    """Score a YouTube candidate in [0.0, 1.0]. Returns 0.0 if duration is out of tolerance."""
+    """Score a YouTube candidate in [0.0, 1.0]. Returns 0.0 if duration is out of tolerance.
+
+    When spotify_duration is 0 (metadata missing), falls back to title-only scoring
+    capped at 0.5 to distinguish from high-confidence duration-matched results.
+    """
     yt_duration = float(candidate["duration"])
-    if yt_duration <= 0 or spotify_duration <= 0:
+    yt_title_lower = candidate["title"].lower()
+    spotify_title_lower = spotify_title.lower()
+
+    if yt_duration <= 0:
         return 0.0
+
+    if spotify_duration <= 0:
+        # Duration unknown: use title similarity as a weak signal (cap at 0.5).
+        # Noise keywords still penalised to avoid karaoke/cover/remix results.
+        score = 0.5
+        for kw in NOISE_KEYWORDS:
+            if kw in yt_title_lower and kw not in spotify_title_lower:
+                score -= NOISE_PENALTY
+        return max(0.0, score)
 
     ratio = yt_duration / spotify_duration
     if not (1 - DURATION_TOLERANCE <= ratio <= 1 + DURATION_TOLERANCE):
@@ -129,8 +145,6 @@ def score_candidate(
     score = 1.0 - abs(ratio - 1.0)
 
     # Penalise noise keywords not present in the Spotify title
-    yt_title_lower = candidate["title"].lower()
-    spotify_title_lower = spotify_title.lower()
     for kw in NOISE_KEYWORDS:
         if kw in yt_title_lower and kw not in spotify_title_lower:
             score -= NOISE_PENALTY
@@ -151,7 +165,10 @@ def resolve_url(
     if not metadata:
         return None, 0.0, {}
 
-    artist = metadata.get("artist", "")
+    # Use first artist only: multi-artist strings (comma-separated) can cause
+    # yt-dlp to misparse the ytsearch: query as multiple sources.
+    artist_raw = metadata.get("artist", "")
+    artist = artist_raw.split(",")[0].strip()
     title = metadata.get("name", "")
     spotify_duration = float(metadata.get("duration", 0))
 

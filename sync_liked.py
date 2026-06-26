@@ -11,6 +11,7 @@ Architecture:
   5. api-path   → truly new songs: spotdl save (Spotify API) + download
   6. removed    → prune liked.spotdl then delete files
 """
+import datetime
 import json
 import pathlib
 import subprocess
@@ -28,6 +29,7 @@ DOWNLOADS_FILE = MUSIC_DIR / "downloads.spotdl"
 BATCH_FILE = MUSIC_DIR / "liked_batch.spotdl"
 FALLBACK_MAP_FILE = MUSIC_DIR / "youtube_fallback_cache.json"
 MISSING_IDS_FILE = MUSIC_DIR / "missing_ids.json"
+COLLISION_AUDIT_FILE = MUSIC_DIR / ".collision_audit.jsonl"
 OUTPUT_TEMPLATE = "{artists}/{album}/{title}"
 BATCH_SIZE = 50
 
@@ -181,6 +183,23 @@ def cleanup_stale_conflicts(
             continue
 
 
+def _log_collision_decision(
+    group: str, owner_id: str, competing_ids: list[str], reason: str
+) -> None:
+    record = {
+        "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "group": group,
+        "owner_id": owner_id,
+        "competing_ids": competing_ids,
+        "reason": reason,
+    }
+    try:
+        with COLLISION_AUDIT_FILE.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+
 def resolve_path_collisions(
     missing_ids: set[str], songs: list[dict], liked_ids_all: set[str]
 ) -> set[str]:
@@ -191,9 +210,14 @@ def resolve_path_collisions(
     If a liked song already occupies the path (WOAS ∈ liked_ids_all), the
     remaining sibling IDs are collision-satisfied — same audio, no separate
     download needed.
+
+    Each resolution decision is appended to COLLISION_AUDIT_FILE (.jsonl) so
+    the owner selection is fully auditable across runs.
     """
     id_to_meta: dict[str, dict] = {s["song_id"]: s for s in songs if "song_id" in s}
     satisfied: set[str] = set()
+    # group_key → {owner_id, competing_ids} for audit log batching
+    decisions: dict[str, dict] = {}
 
     for sid in missing_ids:
         meta = id_to_meta.get(sid)
@@ -218,12 +242,24 @@ def resolve_path_collisions(
             occupying_id = str(woas).rstrip("/").split("/")[-1] if woas else None
             if occupying_id and occupying_id != sid and occupying_id in liked_ids_all:
                 satisfied.add(sid)
+                group_key = f"{artist_str}/{album}/{title}"
+                if group_key not in decisions:
+                    decisions[group_key] = {"owner_id": occupying_id, "competing_ids": []}
+                decisions[group_key]["competing_ids"].append(sid)
                 print(
                     f"[COLLISION] {title} ({sid}) satisfied by sibling {occupying_id}",
                     flush=True,
                 )
         except Exception:
             continue
+
+    for group_key, info in decisions.items():
+        _log_collision_decision(
+            group=group_key,
+            owner_id=info["owner_id"],
+            competing_ids=info["competing_ids"],
+            reason="runtime_first_seen",
+        )
 
     return satisfied
 
