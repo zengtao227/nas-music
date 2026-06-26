@@ -4,11 +4,12 @@ Sync Mia's Spotify Liked Songs to /music.
 
 liked.spotdl = Spotify state database (not a download log).
 Architecture:
-  1. spotapi  → current liked song IDs (authenticated via sp_dc)
-  2. diff     → added = current - saved, removed = saved - current
-  3. fast-path → songs already in downloads.spotdl copied directly (no API)
-  4. added    → spotdl save (metadata) then spotdl download (audio)
-  5. removed  → prune liked.spotdl then spotdl sync (deletes files)
+  1. spotapi    → current liked song IDs (authenticated via sp_dc)
+  2. diff       → added = current - saved, removed = saved - current
+  3. disk-path  → songs already on disk: read ID3 tags, zero API calls
+  4. dl-path    → songs in downloads.spotdl: copy directly, zero API calls
+  5. api-path   → truly new songs: spotdl save (Spotify API) + download
+  6. removed    → prune liked.spotdl then delete files
 """
 import json
 import pathlib
@@ -16,6 +17,7 @@ import subprocess
 import time
 
 import mutagen
+import mutagen.id3
 import spotapi
 
 MUSIC_DIR = pathlib.Path("/music")
@@ -27,12 +29,8 @@ BATCH_FILE = MUSIC_DIR / "liked_batch.spotdl"
 OUTPUT_TEMPLATE = "{artists}/{album}/{title}"
 BATCH_SIZE = 50
 
-# Refuse to delete more than this many files in one run. Real unlikes come a few
-# at a time; hundreds of "removals" means the Spotify snapshot is incomplete
-# (expired cookie / partial pagination), so we skip rather than wipe the library.
 MAX_DELETIONS = 30
 
-# --- Local cache for Spotify IDs (WOAS tag scan) ---
 LOCAL_CACHE_FILE = MUSIC_DIR / ".local_id_cache.json"
 CACHE_TTL = 8 * 60  # 8 minutes
 
@@ -63,6 +61,36 @@ def song_id_from_file(mp3: pathlib.Path) -> str:
     return str(woas).rstrip("/").split("/")[-1]
 
 
+def build_entry_from_disk(mp3: pathlib.Path, song_id: str) -> dict:
+    """Build a liked.spotdl entry from on-disk ID3 tags — no Spotify API needed."""
+    def tag_str(tags: object, key: str) -> str:
+        val = tags.get(key) if tags else None
+        if val is None:
+            return ""
+        return str(val.text[0]) if hasattr(val, "text") else str(val)
+
+    try:
+        tags = mutagen.File(mp3)
+        name = tag_str(tags, "TIT2") or mp3.stem
+        artist = tag_str(tags, "TPE1")
+        album = tag_str(tags, "TALB")
+        track_raw = tag_str(tags, "TRCK")
+        track_num = int(track_raw.split("/")[0]) if track_raw else 0
+    except Exception:
+        name = mp3.stem
+        artist = album = ""
+        track_num = 0
+
+    return {
+        "song_id": song_id,
+        "name": name,
+        "artist": artist,
+        "album_name": album,
+        "track_number": track_num,
+        "song_url": f"https://open.spotify.com/track/{song_id}",
+    }
+
+
 def scan_local_spotify_ids() -> set[str]:
     ids: set[str] = set()
     for mp3 in MUSIC_DIR.rglob("*.mp3"):
@@ -72,6 +100,18 @@ def scan_local_spotify_ids() -> set[str]:
         if sid:
             ids.add(sid)
     return ids
+
+
+def build_local_id_to_path() -> dict[str, pathlib.Path]:
+    """Map Spotify ID → MP3 path for all liked-song files (excludes Playlists/)."""
+    result: dict[str, pathlib.Path] = {}
+    for mp3 in MUSIC_DIR.rglob("*.mp3"):
+        if PLAYLISTS_DIR in mp3.parents:
+            continue
+        sid = song_id_from_file(mp3)
+        if sid:
+            result[sid] = mp3
+    return result
 
 
 def load_local_ids_cached() -> set[str]:
@@ -120,7 +160,7 @@ def load_save_file() -> tuple[list, set[str]]:
 
 
 def load_downloads_map() -> dict[str, dict]:
-    """Build song_id → song-record map from downloads.spotdl (fast copy source)."""
+    """Build song_id → song-record map from downloads.spotdl."""
     if not DOWNLOADS_FILE.exists():
         return {}
     try:
@@ -173,55 +213,67 @@ def main() -> None:
     removed_ids = saved_ids - current_ids
     print(f"Added: {len(added_ids)}  Removed: {len(removed_ids)}", flush=True)
 
-    # --- local prefilter cache ---
-    local_ids = load_local_ids_cached()
-
-    # --- fast-path: copy from downloads.spotdl without Spotify API call ---
-    # downloads.spotdl stores metadata for all previously synced songs.
-    # Songs already there can be merged directly, avoiding spotdl save round-trips.
     if added_ids:
-        downloads_map = load_downloads_map()
-        fast_ids = added_ids & set(downloads_map.keys())
-        if fast_ids:
+        # --- path 1: disk fast-path (read ID3 tags, zero API calls) ---
+        # Scan once; reuse the id→path map for both fast-path and download prefilter.
+        id_to_path = build_local_id_to_path()
+        disk_hits = {sid: id_to_path[sid] for sid in added_ids if sid in id_to_path}
+        if disk_hits:
             known = {s["song_id"] for s in songs}
-            new_from_downloads = [downloads_map[sid] for sid in fast_ids if sid not in known]
-            if new_from_downloads:
-                songs = songs + new_from_downloads
+            new_from_disk = [
+                build_entry_from_disk(path, sid)
+                for sid, path in disk_hits.items()
+                if sid not in known
+            ]
+            if new_from_disk:
+                songs = songs + new_from_disk
                 write_save_file(songs)
-                print(f"Fast-path: copied {len(new_from_downloads)} songs from downloads.spotdl", flush=True)
-            added_ids -= fast_ids
+                print(f"Disk-path: {len(new_from_disk)} songs from ID3 tags (0 API calls)", flush=True)
+            added_ids -= set(disk_hits.keys())
 
-    # --- download added songs (those not covered by fast-path) ---
-    if added_ids:
-        id_list = list(added_ids)
-        total = (len(id_list) + BATCH_SIZE - 1) // BATCH_SIZE
+        # --- path 2: downloads.spotdl fast-path (copy metadata, zero API calls) ---
+        if added_ids:
+            downloads_map = load_downloads_map()
+            fast_ids = added_ids & set(downloads_map.keys())
+            if fast_ids:
+                known = {s["song_id"] for s in songs}
+                new_from_downloads = [downloads_map[sid] for sid in fast_ids if sid not in known]
+                if new_from_downloads:
+                    songs = songs + new_from_downloads
+                    write_save_file(songs)
+                    print(f"DL-path: {len(new_from_downloads)} songs from downloads.spotdl (0 API calls)", flush=True)
+                added_ids -= fast_ids
 
-        for i in range(0, len(id_list), BATCH_SIZE):
-            batch_ids = id_list[i : i + BATCH_SIZE]
-            n = i // BATCH_SIZE + 1
+        # --- path 3: API path — truly new songs not on disk or in downloads.spotdl ---
+        if added_ids:
+            # local_ids reused from id_to_path scan (already done above)
+            local_ids = set(id_to_path.keys())
+            id_list = list(added_ids)
+            total = (len(id_list) + BATCH_SIZE - 1) // BATCH_SIZE
+            print(f"API-path: {len(added_ids)} songs need Spotify metadata ({total} batches)", flush=True)
 
-            missing_ids = [sid for sid in batch_ids if sid not in local_ids]
-            print(f"Batch {n}/{total}: {len(batch_ids)} songs, missing {len(missing_ids)}", flush=True)
+            for i in range(0, len(id_list), BATCH_SIZE):
+                batch_ids = id_list[i : i + BATCH_SIZE]
+                n = i // BATCH_SIZE + 1
+                missing_ids = [sid for sid in batch_ids if sid not in local_ids]
+                print(f"Batch {n}/{total}: {len(batch_ids)} songs, missing {len(missing_ids)}", flush=True)
 
-            # Save metadata for ALL batch songs — liked.spotdl must track even
-            # songs already on disk, so unlike detection works correctly later.
-            urls_all = [f"https://open.spotify.com/track/{sid}" for sid in batch_ids]
-            BATCH_FILE.unlink(missing_ok=True)
-            rc = spotdl_save_with_retry("save", *urls_all, "--save-file", str(BATCH_FILE))
-            if rc != 0 or not BATCH_FILE.exists():
-                print(f"Batch {n}: save failed (rc={rc}), skipping", flush=True)
+                urls_all = [f"https://open.spotify.com/track/{sid}" for sid in batch_ids]
                 BATCH_FILE.unlink(missing_ok=True)
-                continue
+                rc = spotdl_save_with_retry("save", *urls_all, "--save-file", str(BATCH_FILE))
+                if rc != 0 or not BATCH_FILE.exists():
+                    print(f"Batch {n}: save failed (rc={rc}), skipping", flush=True)
+                    BATCH_FILE.unlink(missing_ok=True)
+                    continue
 
-            songs = merge_batch_file(songs)
-            write_save_file(songs)
+                songs = merge_batch_file(songs)
+                write_save_file(songs)
 
-            # Download only songs not already on disk.
-            if missing_ids:
-                urls_missing = [f"https://open.spotify.com/track/{sid}" for sid in missing_ids]
-                spotdl("download", *urls_missing, "--output", OUTPUT_TEMPLATE)
-            else:
-                print(f"Batch {n}: all already on disk, download skipped", flush=True)
+                if missing_ids:
+                    urls_missing = [f"https://open.spotify.com/track/{sid}" for sid in missing_ids]
+                    spotdl("download", *urls_missing, "--output", OUTPUT_TEMPLATE)
+                else:
+                    print(f"Batch {n}: all already on disk, download skipped", flush=True)
 
     # --- remove unliked songs ---
     if removed_ids:
