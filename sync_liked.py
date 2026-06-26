@@ -167,14 +167,11 @@ def main() -> None:
 
             print(f"Batch {n}/{total}: {len(batch_ids)} songs, missing {len(missing_ids)}", flush=True)
 
-            if not missing_ids:
-                print(f"Batch {n}: all already on disk, skipped", flush=True)
-                continue
-
-            urls = [f"https://open.spotify.com/track/{sid}" for sid in missing_ids]
-
+            # Save metadata for ALL batch songs — liked.spotdl must track even
+            # songs already on disk, so unlike detection works correctly later.
+            urls_all = [f"https://open.spotify.com/track/{sid}" for sid in batch_ids]
             BATCH_FILE.unlink(missing_ok=True)
-            rc = spotdl("save", *urls, "--save-file", str(BATCH_FILE))
+            rc = spotdl("save", *urls_all, "--save-file", str(BATCH_FILE))
             if rc != 0 or not BATCH_FILE.exists():
                 print(f"Batch {n}: save failed (rc={rc}), skipping", flush=True)
                 BATCH_FILE.unlink(missing_ok=True)
@@ -183,12 +180,17 @@ def main() -> None:
             songs = merge_batch_file(songs)
             write_save_file(songs)
 
-            spotdl("download", *urls, "--output", OUTPUT_TEMPLATE)
+            # Download only songs not already on disk.
+            if missing_ids:
+                urls_missing = [f"https://open.spotify.com/track/{sid}" for sid in missing_ids]
+                spotdl("download", *urls_missing, "--output", OUTPUT_TEMPLATE)
+            else:
+                print(f"Batch {n}: all already on disk, download skipped", flush=True)
 
     # --- remove unliked songs ---
     if removed_ids:
         if len(removed_ids) > MAX_DELETIONS:
-            print(f"WARNING: too many removals, skipping delete", flush=True)
+            print("WARNING: too many removals, skipping delete", flush=True)
         else:
             songs = [s for s in songs if s.get("song_id") not in removed_ids]
             write_save_file(songs)
