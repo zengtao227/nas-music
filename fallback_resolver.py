@@ -138,16 +138,18 @@ def score_candidate(
     return max(0.0, score)
 
 
-def resolve_url(spotify_id: str, liked_songs: list) -> str | None:
+def resolve_url(
+    spotify_id: str, liked_songs: list
+) -> tuple[str | None, float, dict]:
     """
-    Pure function: Spotify ID → YouTube URL (or None).
-    No side effects beyond returning the URL.
+    Pure function: Spotify ID → (youtube_url | None, best_score, best_candidate).
+    No side effects beyond returning values.
     """
     metadata = next(
         (s for s in liked_songs if s.get("song_id") == spotify_id), None
     )
     if not metadata:
-        return None
+        return None, 0.0, {}
 
     artist = metadata.get("artist", "")
     title = metadata.get("name", "")
@@ -175,10 +177,10 @@ def resolve_url(spotify_id: str, liked_songs: list) -> str | None:
     if scored and scored[0][0] >= MIN_SCORE_THRESHOLD:
         best_score, best = scored[0]
         print(f"  ✓ Best match (score {best_score:.2f}): {best['url']}", flush=True)
-        return best["url"]
+        return best["url"], best_score, best
 
     print("  ✗ No candidate passed thresholds", flush=True)
-    return None
+    return None, 0.0, {}
 
 
 # ---------------------------------------------------------------------------
@@ -235,15 +237,26 @@ def main() -> None:
             skipped_count += 1
             continue
 
-        youtube_url = resolve_url(sid, liked_songs)
+        youtube_url, best_score, best_cand = resolve_url(sid, liked_songs)
 
         if youtube_url:
             if not dry_run:
+                # Store confidence + duration_delta for future auditability.
+                # Low-confidence entries (score < 0.7) are probabilistic guesses.
+                spotify_dur = float(
+                    next(
+                        (s.get("duration", 0) for s in liked_songs if s.get("song_id") == sid),
+                        0,
+                    )
+                )
+                duration_delta = abs(best_cand.get("duration", 0) - spotify_dur)
                 cache[sid] = {
                     "youtube_url": youtube_url,
                     "song_name": label,
                     "spotify_url": f"https://open.spotify.com/track/{sid}",
                     "source": "auto",
+                    "confidence": round(best_score, 3),
+                    "duration_delta_s": round(duration_delta, 1),
                     "resolved_at": now_iso(),
                 }
                 save_json(CACHE_FILE, cache)
