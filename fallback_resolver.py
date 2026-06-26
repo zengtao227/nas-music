@@ -1,32 +1,47 @@
 #!/usr/bin/env python3
 """
-fallback_resolver.py — spotdl Fallback System Resolver
+fallback_resolver.py — Pure URL Resolver (no downloads)
 
-1. Identifies missing songs (exists in liked.spotdl but lacks physical file on disk).
-2. For each missing song:
-   - Queries youtube_fallback_cache.json.
-   - If not cached, runs `yt-dlp` to search top 3 results for "{artists} - {title}".
-   - Filters candidates by duration tolerance (Spotify duration ±15%).
-   - Rates matches, filters noise (cover, karaoke, live), and selects the Best Match URL.
-   - Triggers `spotdl download "YouTubeURL|SpotifyURL"`.
-   - On success, verifies the file tags and caches the result.
+Reads missing_ids.json (produced by sync_liked.py), searches YouTube
+via yt-dlp for each missing Spotify track, and writes resolved
+youtube_url mappings to youtube_fallback_cache.json.
+
+Does NOT call spotdl. Does NOT modify music files.
+The next sync_liked.py run will consume the cache for hybrid download.
+
+Usage:
+    python3 fallback_resolver.py [--dry-run]
 """
 
 import json
 import pathlib
 import subprocess
 import sys
-import time
 from datetime import datetime, timezone
 
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
 MUSIC_DIR = pathlib.Path("/music")
-PLAYLISTS_DIR = MUSIC_DIR / "Playlists"
 SAVE_FILE = MUSIC_DIR / "liked.spotdl"
 CACHE_FILE = MUSIC_DIR / "youtube_fallback_cache.json"
-OUTPUT_TEMPLATE = "{artists}/{album}/{title}"
-INTER_DOWNLOAD_SLEEP = 3
+MISSING_IDS_FILE = MUSIC_DIR / "missing_ids.json"
+
+# ---------------------------------------------------------------------------
+# Tunable constants
+# ---------------------------------------------------------------------------
+DURATION_TOLERANCE = 0.15       # ±15% duration tolerance
+MIN_SCORE_THRESHOLD = 0.4       # candidates below this score are rejected
+CACHE_TTL_DAYS = 90             # entries older than this are re-resolved
+NOISE_KEYWORDS = [              # penalise these unless in the Spotify title
+    "cover", "karaoke", "remix", "live", "slowed", "reverb", "8d",
+]
+NOISE_PENALTY = 0.35            # score deducted per noise keyword matched
 
 
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -47,40 +62,26 @@ def save_json(path: pathlib.Path, data: dict) -> None:
     tmp.replace(path)
 
 
-def get_mp3_woas_id(mp3: pathlib.Path) -> str:
+def is_cache_valid(entry: dict | None) -> bool:
+    """Return True if the cache entry exists and is not older than CACHE_TTL_DAYS."""
+    if not entry or not entry.get("youtube_url"):
+        return False
+    resolved_at = entry.get("resolved_at", "")
+    if not resolved_at:
+        return False
     try:
-        import mutagen
-        tags = mutagen.File(mp3)
-        woas = tags.get("WOAS") if tags else None
-        if woas:
-            return str(woas).rstrip("/").split("/")[-1]
-    except Exception:
-        pass
-    return ""
+        ts = datetime.fromisoformat(resolved_at.replace("Z", "+00:00"))
+        age_days = (datetime.now(timezone.utc) - ts).days
+        return age_days < CACHE_TTL_DAYS
+    except ValueError:
+        return False
 
 
-def scan_local_spotify_ids() -> dict[str, pathlib.Path]:
-    """Returns spotify_id -> mp3 path mapping for existing local files."""
-    local_map = {}
-    for mp3 in MUSIC_DIR.rglob("*.mp3"):
-        if PLAYLISTS_DIR in mp3.parents:
-            continue
-        sid = get_mp3_woas_id(mp3)
-        if sid:
-            local_map[sid] = mp3
-    return local_map
-
-
-def get_spotify_track_metadata(spotify_id: str, liked_songs: list) -> dict | None:
-    """Finds song metadata inside liked.spotdl without calling Spotify API."""
-    for s in liked_songs:
-        if s.get("song_id") == spotify_id:
-            return s
-    return None
-
-
+# ---------------------------------------------------------------------------
+# YouTube search + scoring
+# ---------------------------------------------------------------------------
 def search_youtube_candidates(query: str) -> list[dict]:
-    """Search YouTube using yt-dlp, returning top 3 candidates with title, url, duration."""
+    """Search YouTube using yt-dlp, returning top 3 candidates."""
     cmd = [
         "yt-dlp",
         f"ytsearch3:{query}",
@@ -98,171 +99,167 @@ def search_youtube_candidates(query: str) -> list[dict]:
                 info = json.loads(line)
                 candidates.append({
                     "title": info.get("title", ""),
-                    "url": info.get("webpage_url") or f"https://www.youtube.com/watch?v={info.get('id')}",
+                    "url": (
+                        info.get("webpage_url")
+                        or f"https://www.youtube.com/watch?v={info.get('id')}"
+                    ),
                     "duration": info.get("duration", 0),
                 })
             except json.JSONDecodeError:
                 continue
         return candidates
     except Exception as exc:
-        print(f"  ⚠️ yt-dlp search failed for '{query}': {exc}", flush=True)
+        print(f"  ⚠️  yt-dlp search failed for '{query}': {exc}", flush=True)
         return []
 
 
-def score_candidate(candidate: dict, spotify_title: str, spotify_duration: float) -> float:
-    """
-    Scores a YouTube candidate (0.0 to 1.0).
-    Filters/penalizes if duration is out of ±15% tolerance.
-    Penalizes keyword noise if Spotify title doesn't suggest them.
-    """
-    yt_title = candidate["title"].lower()
+def score_candidate(
+    candidate: dict, spotify_title: str, spotify_duration: float
+) -> float:
+    """Score a YouTube candidate in [0.0, 1.0]. Returns 0.0 if duration is out of tolerance."""
     yt_duration = float(candidate["duration"])
-    
     if yt_duration <= 0 or spotify_duration <= 0:
         return 0.0
-        
-    # 1. Duration Tolerance Filter (±15%)
+
     ratio = yt_duration / spotify_duration
-    if not (0.85 <= ratio <= 1.15):
+    if not (1 - DURATION_TOLERANCE <= ratio <= 1 + DURATION_TOLERANCE):
         return 0.0
-        
-    # Base score on duration closeness
+
+    # Base score: closeness to target duration
     score = 1.0 - abs(ratio - 1.0)
-    
-    # 2. Penalize Noise Keywords unless present in Spotify Title
+
+    # Penalise noise keywords not present in the Spotify title
+    yt_title_lower = candidate["title"].lower()
     spotify_title_lower = spotify_title.lower()
-    noise_keywords = ["cover", "karaoke", "remix", "live", "slowed", "reverb", "8d"]
-    for kw in noise_keywords:
-        if kw in yt_title and kw not in spotify_title_lower:
-            score -= 0.35  # Significant penalty
-            
+    for kw in NOISE_KEYWORDS:
+        if kw in yt_title_lower and kw not in spotify_title_lower:
+            score -= NOISE_PENALTY
+
     return max(0.0, score)
 
 
+def resolve_url(spotify_id: str, liked_songs: list) -> str | None:
+    """
+    Pure function: Spotify ID → YouTube URL (or None).
+    No side effects beyond returning the URL.
+    """
+    metadata = next(
+        (s for s in liked_songs if s.get("song_id") == spotify_id), None
+    )
+    if not metadata:
+        return None
+
+    artist = metadata.get("artist", "")
+    title = metadata.get("name", "")
+    spotify_duration = float(metadata.get("duration", 0))
+
+    query = f"{artist} - {title}"
+    print(
+        f"  → Searching: '{query}' (target: {spotify_duration:.0f}s)",
+        flush=True,
+    )
+    candidates = search_youtube_candidates(query)
+
+    scored = sorted(
+        [(score_candidate(c, title, spotify_duration), c) for c in candidates],
+        key=lambda x: x[0],
+        reverse=True,
+    )
+
+    for score, cand in scored:
+        print(
+            f"     Score {score:.2f} | {cand['duration']}s | {cand['title'][:60]}",
+            flush=True,
+        )
+
+    if scored and scored[0][0] >= MIN_SCORE_THRESHOLD:
+        best_score, best = scored[0]
+        print(f"  ✓ Best match (score {best_score:.2f}): {best['url']}", flush=True)
+        return best["url"]
+
+    print("  ✗ No candidate passed thresholds", flush=True)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main() -> None:
     dry_run = "--dry-run" in sys.argv
-    filter_ids = None
-    for arg in sys.argv[1:]:
-        if arg.startswith("--ids="):
-            filter_ids = set(arg.split("=", 1)[1].split(","))
 
-    print("=== Fallback Resolver ===", flush=True)
+    print("=== Fallback Resolver (pure resolver — no downloads) ===", flush=True)
     if dry_run:
-        print("[DRY RUN mode — no downloads or cache updates]", flush=True)
+        print("[DRY RUN — cache will not be written]", flush=True)
 
-    # Load liked database (L1 output)
-    liked_songs = load_json(SAVE_FILE)
-    if not isinstance(liked_songs, list):
-        liked_songs = liked_songs.get("songs", []) if isinstance(liked_songs, dict) else []
-    
-    spotify_liked_ids = {s["song_id"] for s in liked_songs if "song_id" in s}
-    print(f"Total liked songs in database: {len(spotify_liked_ids)}", flush=True)
-
-    # Scan physical files on disk
-    local_tracks = scan_local_spotify_ids()
-    print(f"Total verified local MP3 tracks: {len(local_tracks)}", flush=True)
-
-    # missing_ids are liked but not on disk
-    missing_ids = spotify_liked_ids - set(local_tracks.keys())
-    if filter_ids is not None:
-        missing_ids = missing_ids & filter_ids
-
-    print(f"Total missing tracks: {len(missing_ids)}", flush=True)
-    if not missing_ids:
-        print("No missing tracks to process. Done.", flush=True)
+    # 1. Read missing_ids.json (produced by sync_liked.py)
+    if not MISSING_IDS_FILE.exists():
+        print(
+            "missing_ids.json not found. Run sync_liked.py first to generate it.",
+            flush=True,
+        )
         return
 
-    # Load history cache (L3)
-    cache = load_json(CACHE_FILE)
+    missing_ids: list[str] = load_json(MISSING_IDS_FILE)  # type: ignore[assignment]
+    if not isinstance(missing_ids, list) or not missing_ids:
+        print("No missing IDs found in missing_ids.json. Nothing to resolve.", flush=True)
+        return
+
+    print(f"Missing IDs to resolve: {len(missing_ids)}", flush=True)
+
+    # 2. Load liked.spotdl for metadata
+    liked_songs = load_json(SAVE_FILE)
+    if isinstance(liked_songs, dict):
+        liked_songs = liked_songs.get("songs", [])
+
+    # 3. Load existing cache
+    cache: dict = load_json(CACHE_FILE)  # type: ignore[assignment]
     if not isinstance(cache, dict):
         cache = {}
 
-    success_count = 0
-    fail_count = 0
+    resolved_count = 0
+    skipped_count = 0
+    failed_count = 0
 
     for idx, sid in enumerate(missing_ids, 1):
-        metadata = get_spotify_track_metadata(sid, liked_songs)
-        if not metadata:
-            print(f"[{idx}/{len(missing_ids)}] ID {sid}: metadata missing in liked.spotdl, skipping", flush=True)
-            fail_count += 1
+        metadata = next((s for s in liked_songs if s.get("song_id") == sid), None)
+        label = (
+            f"{metadata.get('artist','')} - {metadata.get('name','')}"
+            if metadata
+            else sid
+        )
+        print(f"\n[{idx}/{len(missing_ids)}] {label}", flush=True)
+
+        # Check cache validity first
+        if is_cache_valid(cache.get(sid)):
+            print("  → Cache hit (still valid)", flush=True)
+            skipped_count += 1
             continue
 
-        title = metadata.get("name", "Unknown Title")
-        artist = metadata.get("artist", "Unknown Artist")
-        spotify_duration = float(metadata.get("duration", 0))
+        youtube_url = resolve_url(sid, liked_songs)
 
-        print(f"\n[{idx}/{len(missing_ids)}] Resolving: {artist} - {title} (ID: {sid})", flush=True)
-
-        youtube_url = None
-        cached = cache.get(sid)
-
-        # Step 1: Check Cache
-        if cached and cached.get("verified") and cached.get("youtube_url"):
-            print(f"  -> Cache Hit: {cached['youtube_url']}", flush=True)
-            youtube_url = cached["youtube_url"]
-        else:
-            # Step 2: Auto Search YouTube
-            search_query = f"{artist} - {title}"
-            print(f"  -> Searching YouTube for: '{search_query}' (target duration: {spotify_duration:.1f}s)", flush=True)
-            candidates = search_youtube_candidates(search_query)
-            
-            scored_candidates = []
-            for cand in candidates:
-                score = score_candidate(cand, title, spotify_duration)
-                scored_candidates.append((score, cand))
-                print(f"     Score {score:.2f} | Dur: {cand['duration']}s | Title: {cand['title'][:60]}", flush=True)
-
-            # Sort by score descending
-            scored_candidates.sort(key=lambda x: x[0], reverse=True)
-            
-            if scored_candidates and scored_candidates[0][0] > 0.4:
-                best_score, best_cand = scored_candidates[0]
-                youtube_url = best_cand["url"]
-                print(f"  -> Selected Best Match (Score {best_score:.2f}): {youtube_url}", flush=True)
-            else:
-                print("  ❌ No candidate passed duration tolerance & filtering thresholds", flush=True)
-                fail_count += 1
-                continue
-
-        if dry_run:
-            print("  [DRY RUN] skipped downloading", flush=True)
-            continue
-
-        # Step 3: Trigger spotdl download
-        spotify_url = f"https://open.spotify.com/track/{sid}"
-        query = f"{youtube_url}|{spotify_url}"
-        cmd = ["spotdl", "download", query, "--output", OUTPUT_TEMPLATE]
-        
-        print(f"  -> Triggering spotdl download...", flush=True)
-        res = subprocess.run(cmd, cwd=str(MUSIC_DIR))
-        
-        if res.returncode == 0:
-            # Scan again to verify it is now physically on disk and matches ID
-            time.sleep(1)
-            updated_tracks = scan_local_spotify_ids()
-            if sid in updated_tracks:
-                print(f"  ✅ Verified on disk: {updated_tracks[sid].relative_to(MUSIC_DIR)}", flush=True)
-                
-                # Step 4: Write Cache
+        if youtube_url:
+            if not dry_run:
                 cache[sid] = {
                     "youtube_url": youtube_url,
-                    "song_name": f"{artist} - {title}",
-                    "spotify_url": spotify_url,
+                    "song_name": label,
+                    "spotify_url": f"https://open.spotify.com/track/{sid}",
                     "source": "auto",
-                    "verified": True,
-                    "verified_at": now_iso()
+                    "resolved_at": now_iso(),
                 }
                 save_json(CACHE_FILE, cache)
-                success_count += 1
-            else:
-                print("  ⚠️ spotdl finished but verified file not found on disk", flush=True)
-                fail_count += 1
+            resolved_count += 1
         else:
-            print(f"  ❌ spotdl failed with exit code {res.returncode}", flush=True)
-            fail_count += 1
+            failed_count += 1
 
-        time.sleep(INTER_DOWNLOAD_SLEEP)
+    print(f"\n=== Resolver Summary ===", flush=True)
+    print(f"Resolved  : {resolved_count}", flush=True)
+    print(f"Skipped   : {skipped_count} (valid cache)", flush=True)
+    print(f"Failed    : {failed_count}", flush=True)
+    print(
+        "\nRun sync_liked.py next to consume resolved URLs via hybrid download.",
+        flush=True,
+    )
 
-    print(f"\n=== Resolver Summary ===")
-    print(f"Successfully processed : {success_count}")
-    print(f"Failed to process      : {fail_count}")
+
+if __name__ == "__main__":
+    main()

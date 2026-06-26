@@ -26,6 +26,8 @@ SP_DC_FILE = MUSIC_DIR / ".spotify_sp_dc"
 SAVE_FILE = MUSIC_DIR / "liked.spotdl"
 DOWNLOADS_FILE = MUSIC_DIR / "downloads.spotdl"
 BATCH_FILE = MUSIC_DIR / "liked_batch.spotdl"
+FALLBACK_MAP_FILE = MUSIC_DIR / "youtube_fallback_cache.json"
+MISSING_IDS_FILE = MUSIC_DIR / "missing_ids.json"
 OUTPUT_TEMPLATE = "{artists}/{album}/{title}"
 BATCH_SIZE = 50
 
@@ -159,6 +161,21 @@ def load_save_file() -> tuple[list, set[str]]:
     return songs, {s["song_id"] for s in songs if "song_id" in s}
 
 
+def load_fallback_map() -> dict[str, str]:
+    """Returns spotify_id → youtube_url for entries in the fallback cache."""
+    if not FALLBACK_MAP_FILE.exists():
+        return {}
+    try:
+        data = json.loads(FALLBACK_MAP_FILE.read_text())
+        return {
+            sid: entry["youtube_url"]
+            for sid, entry in data.items()
+            if isinstance(entry, dict) and entry.get("youtube_url")
+        }
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
 def load_downloads_map() -> dict[str, dict]:
     """Build song_id → song-record map from downloads.spotdl."""
     if not DOWNLOADS_FILE.exists():
@@ -288,6 +305,29 @@ def main() -> None:
             write_save_file(songs)
             n = delete_files_for_ids(removed_ids)
             print(f"Removed {len(removed_ids)} from DB, deleted {n} files", flush=True)
+
+    # --- fallback consumption path ---
+    # Identify songs still missing after primary sync, consume pre-resolved URLs
+    local_ids_after_sync = scan_local_spotify_ids()
+    liked_ids_all = {s["song_id"] for s in songs if "song_id" in s}
+    missing_ids = liked_ids_all - local_ids_after_sync
+
+    fallback_map = load_fallback_map()
+    resolved = {sid: fallback_map[sid] for sid in missing_ids if sid in fallback_map}
+
+    if resolved:
+        print(f"Fallback: {len(resolved)} pre-resolved URLs found, attempting hybrid download", flush=True)
+        for sid, yt_url in resolved.items():
+            spotify_url = f"https://open.spotify.com/track/{sid}"
+            spotdl("download", f"{yt_url}|{spotify_url}", "--output", OUTPUT_TEMPLATE)
+
+    # Write missing_ids.json snapshot (still-missing after all paths)
+    local_ids_final = scan_local_spotify_ids()
+    still_missing = list(liked_ids_all - local_ids_final)
+    tmp = MISSING_IDS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(still_missing))
+    tmp.replace(MISSING_IDS_FILE)
+    print(f"missing_ids.json: {len(still_missing)} unresolved songs written", flush=True)
 
     print("Done.", flush=True)
 
