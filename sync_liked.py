@@ -141,11 +141,28 @@ def get_liked_ids() -> set[str]:
     dump = {"identifier": "mia", "password": "", "cookies": {"sp_dc": sp_dc}}
     login = spotapi.Login.from_cookies(dump, cfg)
     ids: set[str] = set()
+    declared_total: int | None = None
     for chunk in spotapi.PrivatePlaylist(login).paginate_saved_tracks():
+        if declared_total is None:
+            # WHY: Spotify's API reports the true total in every chunk via
+            # 'totalCount'. Reading it once from the first chunk lets us verify
+            # completeness after pagination without any extra API calls or
+            # heuristic thresholds.
+            declared_total = chunk.get("totalCount")
         for item in chunk.get("items", []):
             uri = (item.get("track") or {}).get("_uri", "")
             if uri:
                 ids.add(uri.split(":")[-1])
+    # Integrity check: if we received fewer IDs than Spotify declared, pagination
+    # was interrupted (network cut, API bug, spotapi parsing failure). Raise so
+    # the caller aborts the run — prevents spurious removals on a partial snapshot.
+    if declared_total is None:
+        print("WARNING: Spotify did not return totalCount — integrity check skipped", flush=True)
+    elif len(ids) < declared_total:
+        raise RuntimeError(
+            f"Incomplete Spotify fetch: got {len(ids)}, declared {declared_total} "
+            "— aborting to prevent spurious deletions"
+        )
     return ids
 
 
@@ -222,7 +239,11 @@ def delete_files_for_ids(removed_ids: set[str]) -> int:
 def main() -> None:
     print("=== Liked Songs Sync ===", flush=True)
 
-    current_ids = get_liked_ids()
+    try:
+        current_ids = get_liked_ids()
+    except RuntimeError as exc:
+        print(f"ABORT: {exc}", flush=True)
+        return
     print(f"Spotify liked: {len(current_ids)}", flush=True)
 
     songs, saved_ids = load_save_file()
