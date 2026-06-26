@@ -116,6 +116,62 @@ def build_local_id_to_path() -> dict[str, pathlib.Path]:
     return result
 
 
+def cleanup_stale_conflicts(
+    missing_ids: set[str], songs: list[dict]
+) -> None:
+    """Remove stale-WOAS placeholder files that would cause spotdl to skip a download.
+
+    WHY: spotdl's skip-existing check is filename-based, not Spotify-ID-based.
+    When a track's Spotify ID changes (re-release / label re-upload), the old
+    file keeps its old WOAS tag and occupies the filename spotdl would write for
+    the new ID.  spotdl sees the file → skips → new ID never lands → infinite
+    cron loop.
+
+    Strategy: use liked.spotdl (authoritative) + OUTPUT_TEMPLATE (deterministic)
+    to compute the exact path spotdl would write.  If that path already exists
+    AND its WOAS tag differs from the target Spotify ID, the file is a stale
+    placeholder → delete it so the next spotdl call can land the correct asset.
+
+    Identity key: WOAS only.  No fuzzy matching, no ISRC, no artist/title join.
+    """
+    id_to_meta: dict[str, dict] = {s["song_id"]: s for s in songs if "song_id" in s}
+
+    for sid in missing_ids:
+        meta = id_to_meta.get(sid)
+        if not meta:
+            continue
+
+        # Deterministic path computation — same template spotdl uses.
+        artists = meta.get("artists") or []
+        artist_str = ", ".join(artists) if artists else (meta.get("artist") or "")
+        album = meta.get("album_name") or ""
+        title = meta.get("name") or ""
+        if not (artist_str and title):
+            continue
+
+        expected: pathlib.Path = MUSIC_DIR / artist_str / album / f"{title}.mp3"
+        if not expected.exists():
+            continue
+
+        try:
+            tags = mutagen.File(expected)
+            if not tags:
+                continue
+            woas = tags.get("WOAS")
+            current_id = str(woas).rstrip("/").split("/")[-1] if woas else None
+            # Guard: only delete when WOAS is present and explicitly mismatches.
+            # No WOAS → file was not downloaded by this system → leave untouched.
+            if current_id and current_id != sid:
+                print(
+                    f"[CLEAN] stale placeholder removed: {expected.name}"
+                    f" (WOAS={current_id}, want={sid})",
+                    flush=True,
+                )
+                expected.unlink()
+        except Exception:
+            continue
+
+
 def load_local_ids_cached() -> set[str]:
     try:
         if LOCAL_CACHE_FILE.exists():
@@ -332,6 +388,13 @@ def main() -> None:
     local_ids_after_sync = scan_local_spotify_ids()
     liked_ids_all = {s["song_id"] for s in songs if "song_id" in s}
     missing_ids = liked_ids_all - local_ids_after_sync
+
+    # WHY: before invoking spotdl, remove any stale-WOAS placeholder files
+    # that would cause spotdl to skip the download (it deduplicates by filename,
+    # not by Spotify ID).  cleanup_stale_conflicts computes the expected path
+    # deterministically from liked.spotdl + OUTPUT_TEMPLATE and removes only
+    # files whose WOAS explicitly mismatches the target Spotify ID.
+    cleanup_stale_conflicts(missing_ids, songs)
 
     fallback_map = load_fallback_map()
     resolved = {sid: fallback_map[sid] for sid in missing_ids if sid in fallback_map}
