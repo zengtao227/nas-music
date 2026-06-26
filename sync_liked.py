@@ -119,6 +119,31 @@ def build_local_id_to_path() -> dict[str, pathlib.Path]:
     return result
 
 
+# ─── COLLISION RESOLUTION CONTRACT ───────────────────────────────────────────
+# Three invariants that ALL collision-related code MUST uphold.
+# Breaking any one silently corrupts convergence guarantees.
+#
+# I1. IDENTITY
+#     WOAS tag == canonical Spotify Track ID for a file.
+#     A file is "satisfied" only when its WOAS ∈ liked_ids_all.
+#
+# I2. DETERMINISTIC OWNERSHIP
+#     For any collision group (2+ liked IDs → same {artist}/{album}/{title}),
+#     canonical owner = min(sorted sibling IDs).
+#     This rule MUST NOT depend on filesystem state, cache order, or timing.
+#     Corollary: replay with the same liked.spotdl always yields the same owner.
+#
+# I3. NON-OWNER SUPPRESSION
+#     Non-owner IDs are NEVER added to the fallback download queue.
+#     Non-owner IDs are ALWAYS marked collision-satisfied in missing_ids.json.
+#     A non-owner file on disk is a transitional artifact; cleanup removes it.
+#
+# Functions in scope: build_collision_groups, cleanup_stale_conflicts,
+#                     resolve_path_collisions, and the fallback section of main.
+# Adding or changing any of these four touch-points requires re-verifying I1–I3.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def build_collision_groups(songs: list[dict]) -> dict[str, list[str]]:
     """Map stable path key → sorted sibling IDs for all collision groups.
 
