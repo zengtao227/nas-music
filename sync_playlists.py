@@ -119,6 +119,18 @@ def sync_playlist(login: spotapi.Login, pl: dict) -> None:
     removed_ids = saved_ids - current_ids
     print(f"Current: {len(current_ids)}  Added: {len(added_ids)}  Removed: {len(removed_ids)}", flush=True)
 
+    # WHY: if pagination was truncated (network error, API rate limit), current_ids
+    # will be far smaller than saved_ids. The MAX_DELETIONS guard protects deletion,
+    # but an incomplete snapshot would also silently skip adding songs already on the
+    # server. Skip the entire run rather than operate on a broken snapshot.
+    if saved_ids and len(current_ids) < max(5, int(0.5 * len(saved_ids))):
+        print(
+            f"WARNING: snapshot too small ({len(current_ids)} vs {len(saved_ids)} saved) — "
+            "possible pagination failure, skipping this run",
+            flush=True,
+        )
+        return
+
     # --- add new songs ---
     if added_ids:
         id_list = list(added_ids)
@@ -139,13 +151,24 @@ def sync_playlist(login: spotapi.Login, pl: dict) -> None:
             raw = json.loads(batch_file.read_text())
             batch_songs: list = raw if isinstance(raw, list) else raw.get("songs", [])
             known = {s["song_id"] for s in songs}
-            songs = songs + [s for s in batch_songs if s.get("song_id") not in known]
+            batch_new = [s for s in batch_songs if s.get("song_id") not in known]
+            songs = songs + batch_new
             batch_file.unlink(missing_ok=True)
             write_save_file(save_file, songs)
 
             # cwd=MUSIC_DIR so the "Playlists/{folder}/..." template lands at the
             # right path; cwd=folder would nest a second Playlists/{folder}/ inside.
-            spotdl("download", *urls, "--output", output_template, cwd=MUSIC_DIR)
+            dl_rc = spotdl("download", *urls, "--output", output_template, cwd=MUSIC_DIR)
+            if dl_rc != 0:
+                # WHY: save succeeded but download failed — roll back the save so
+                # next run retries instead of treating these songs as permanently tracked.
+                added_ids_set = {s["song_id"] for s in batch_new if "song_id" in s}
+                songs = [s for s in songs if s.get("song_id") not in added_ids_set]
+                write_save_file(save_file, songs)
+                print(
+                    f"Batch {n}: download failed (rc={dl_rc}), rolled back — will retry next run",
+                    flush=True,
+                )
 
     # --- remove songs no longer in the playlist ---
     # Guard wraps both prune and delete: an implausibly large count means the

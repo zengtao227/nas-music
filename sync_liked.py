@@ -19,7 +19,6 @@ import time
 from collections import defaultdict
 
 import mutagen
-import mutagen.id3
 import spotapi
 
 MUSIC_DIR = pathlib.Path("/music")
@@ -35,10 +34,6 @@ OUTPUT_TEMPLATE = "{artists}/{album}/{title}"
 BATCH_SIZE = 50
 
 MAX_DELETIONS = 30
-
-LOCAL_CACHE_FILE = MUSIC_DIR / ".local_id_cache.json"
-CACHE_TTL = 8 * 60  # 8 minutes
-
 
 def spotdl(*args: str) -> int:
     return subprocess.run(["spotdl", *args], cwd=str(MUSIC_DIR)).returncode
@@ -277,25 +272,6 @@ def resolve_path_collisions(
                 )
 
     return satisfied
-
-
-def load_local_ids_cached() -> set[str]:
-    try:
-        if LOCAL_CACHE_FILE.exists():
-            data = json.loads(LOCAL_CACHE_FILE.read_text())
-            ts = data.get("ts", 0)
-            if time.time() - ts < CACHE_TTL:
-                return set(data.get("ids", []))
-    except Exception:
-        pass
-    ids = scan_local_spotify_ids()
-    try:
-        tmp = LOCAL_CACHE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"ts": time.time(), "ids": list(ids)}))
-        tmp.replace(LOCAL_CACHE_FILE)
-    except Exception:
-        pass
-    return ids
 
 
 def get_liked_ids() -> set[str]:

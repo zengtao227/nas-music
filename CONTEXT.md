@@ -35,8 +35,8 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 ├── sync_liked.py / sync_liked.sh          ← Liked Songs 同步脚本
 ├── sync_playlists.py / sync_playlists.sh  ← 私有歌单同步脚本
 ├── check_cookie.sh                        ← cookie 有效性检测脚本
-├── fallback_download.py                   ← Fallback 下载脚本（YouTube 二层解析）
-├── youtube_fallback_map.json              ← Spotify ID → YouTube URL 知识库
+├── fallback_resolver.py                   ← Fallback 纯解析脚本（yt-dlp 搜索，不下载）
+├── youtube_fallback_cache.json            ← Spotify ID → YouTube URL 解析缓存
 └── Playlists/
     ├── summer26/
     │   ├── summer26.spotdl           ← Summer 26 追踪文件
@@ -233,11 +233,28 @@ spotdl download "YouTubeURL|SpotifyURL" --output "{artists}/{album}/{title}"
 
 | 文件 | 说明 |
 |------|------|
-| `youtube_fallback_map.json` | Spotify Track ID → YouTube URL 永久知识库 |
-| `fallback_download.py` | Fallback 下载脚本（Docker 容器内运行） |
+| `youtube_fallback_cache.json` | Spotify Track ID → YouTube URL 解析缓存（resolver 写入，sync_liked 消费） |
+| `fallback_resolver.py` | 纯解析脚本：yt-dlp 搜索并写入缓存，不下载音频 |
+| `missing_ids.json` | sync_liked.py 写出的待解析 ID 列表，resolver 读取此文件 |
 
-### youtube_fallback_map.json 结构
+### youtube_fallback_cache.json 结构
 
+自动解析条目（`fallback_resolver.py` 写入）：
+```json
+{
+  "spotify_track_id": {
+    "youtube_url": "https://www.youtube.com/watch?v=...",
+    "song_name": "Artist - Title",
+    "spotify_url": "https://open.spotify.com/track/...",
+    "source": "auto",
+    "confidence": 0.85,
+    "duration_delta_s": 2.3,
+    "resolved_at": "2026-06-26T00:00:00Z"
+  }
+}
+```
+
+手动添加条目（人工验证后直接写入）：
 ```json
 {
   "spotify_track_id": {
@@ -246,14 +263,14 @@ spotdl download "YouTubeURL|SpotifyURL" --output "{artists}/{album}/{title}"
     "spotify_url": "https://open.spotify.com/track/...",
     "source": "manual",
     "verified": true,
-    "created_at": "2026-06-26T00:00:00Z",
-    "verified_at": "2026-06-26T00:00:00Z"
+    "created_at": "2026-06-26T00:00:00Z"
   }
 }
 ```
 
-- `source`: `"manual"`（人工验证）或 `"auto"`（脚本搜索）
-- `verified`: 仅在 spotdl 下载**成功**且 WOAS 验证通过后设为 `true`
+- `source`: `"auto"`（resolver 自动搜索）或 `"manual"`（人工填写）
+- `confidence`: 自动条目的置信度评分（0.0–1.0），低于 0.4 不会被写入
+- `resolved_at`: resolver 写入时间；90 天后 resolver 会重新搜索
 
 ### 运行方式
 
@@ -263,25 +280,25 @@ sudo /usr/local/bin/docker run --rm \
   -v /volume1/homes/Mia/Music:/music \
   --entrypoint python3 \
   spotdl-local:latest \
-  /music/fallback_download.py
+  /music/fallback_resolver.py
 
 # 仅处理指定 ID
 sudo /usr/local/bin/docker run --rm \
   -v /volume1/homes/Mia/Music:/music \
   --entrypoint python3 \
   spotdl-local:latest \
-  /music/fallback_download.py --ids=spotify_id1,spotify_id2
+  /music/fallback_resolver.py --ids=spotify_id1,spotify_id2
 
 # 预演（不下载）
 sudo /usr/local/bin/docker run --rm \
   -v /volume1/homes/Mia/Music:/music \
   --entrypoint python3 \
   spotdl-local:latest \
-  /music/fallback_download.py --dry-run
+  /music/fallback_resolver.py --dry-run
 ```
 
 ### 实施阶段
 
-- **Phase 1（当前）**：手动维护 `youtube_fallback_map.json`，按需运行脚本
-- **Phase 2**（若每月失败 > 5 首）：在 `sync_liked.py` 内嵌 LookupError → yt-dlp 搜索 → fallback 下载逻辑
-- **Phase 3**（若 YouTube 真正缺失 > 10%）：评估新平台
+- **Phase 1（完成）**：`fallback_resolver.py` 自动 yt-dlp 搜索，写入 `youtube_fallback_cache.json`；手动条目也可直接填写
+- **Phase 2（当前，已集成）**：`sync_liked.py` 自动消费缓存，对所有 missing_ids 执行 hybrid download（YouTube 音频 + Spotify 元数据）
+- **Phase 3**（若 YouTube 真正缺失 > 10%）：评估 Bilibili / SoundCloud 等新平台
