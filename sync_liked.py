@@ -318,18 +318,52 @@ def load_save_file() -> tuple[list, set[str]]:
 
 
 def load_fallback_map() -> dict[str, str]:
-    """Returns spotify_id → youtube_url for entries in the fallback cache."""
+    """Returns spotify_id → youtube_url, filtered by source trust rules.
+
+    Trust rules (all five must be considered before accepting an entry):
+    1. verified=false          → reject always, regardless of source
+    2. source=manual           → accept if verified absent or true
+    3. source=auto, new format → accept if confidence >= 0.35 AND resolved_at < 90 days
+    4. source=auto, old format → accept if verified=true (legacy allowlist)
+    5. source=auto, old format, no verified=true → reject
+    """
     if not FALLBACK_MAP_FILE.exists():
         return {}
     try:
         data = json.loads(FALLBACK_MAP_FILE.read_text())
-        return {
-            sid: entry["youtube_url"]
-            for sid, entry in data.items()
-            if isinstance(entry, dict) and entry.get("youtube_url")
-        }
     except (json.JSONDecodeError, OSError):
         return {}
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    result: dict[str, str] = {}
+    for sid, entry in data.items():
+        if not isinstance(entry, dict) or not entry.get("youtube_url"):
+            continue
+        if entry.get("verified") is False:  # rule 1: explicit false always rejects
+            continue
+        source = entry.get("source", "manual")
+        if source == "manual":
+            result[sid] = entry["youtube_url"]  # rule 2
+            continue
+        # auto source
+        has_new_fields = "confidence" in entry and bool(entry.get("resolved_at"))
+        if has_new_fields:
+            # rule 3: new resolver format — apply confidence + TTL
+            if entry.get("confidence", 0) < 0.35:
+                continue
+            try:
+                ts = datetime.datetime.fromisoformat(
+                    entry["resolved_at"].replace("Z", "+00:00")
+                )
+                if (now - ts).days >= 90:
+                    continue
+            except ValueError:
+                continue
+            result[sid] = entry["youtube_url"]
+        elif entry.get("verified") is True:
+            result[sid] = entry["youtube_url"]  # rule 4: old auto + verified=true
+        # rule 5: old auto, no confidence/resolved_at, no verified=true → skip
+    return result
 
 
 def load_downloads_map() -> dict[str, dict]:
@@ -386,6 +420,17 @@ def main() -> None:
     print(f"Spotify liked: {len(current_ids)}", flush=True)
 
     songs, saved_ids = load_save_file()
+    # WHY: totalCount missing means we can't compare against Spotify's declared count.
+    # This proportional guard catches truncated pagination even without totalCount:
+    # if Spotify returns < 80% of what we already had, the snapshot is incomplete.
+    # Fail-closed here rather than risk spurious deletions on a partial snapshot.
+    if saved_ids and len(current_ids) < int(0.8 * len(saved_ids)):
+        print(
+            f"WARNING: liked snapshot too small ({len(current_ids)} vs {len(saved_ids)} saved) — "
+            "possible pagination failure, aborting",
+            flush=True,
+        )
+        return
     added_ids = current_ids - saved_ids
     removed_ids = saved_ids - current_ids
     print(f"Added: {len(added_ids)}  Removed: {len(removed_ids)}", flush=True)
