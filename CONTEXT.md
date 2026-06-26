@@ -29,11 +29,14 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 
 ```
 /volume1/homes/Mia/Music/
-├── {artists}/{album}/{title}.mp3     ← Liked Songs（直接在根目录展开）
-├── liked.spotdl                      ← Liked Songs 追踪文件
-├── sync_liked.py / sync_liked.sh     ← Liked Songs 同步脚本
+├── {artists}/{album}/{title}.mp3          ← Liked Songs（直接在根目录展开）
+├── liked.spotdl                           ← Liked Songs 追踪文件
+├── downloads.spotdl                       ← spotdl 全局下载记录（自动维护）
+├── sync_liked.py / sync_liked.sh          ← Liked Songs 同步脚本
 ├── sync_playlists.py / sync_playlists.sh  ← 私有歌单同步脚本
-├── check_cookie.sh                   ← cookie 有效性检测脚本
+├── check_cookie.sh                        ← cookie 有效性检测脚本
+├── fallback_download.py                   ← Fallback 下载脚本（YouTube 二层解析）
+├── youtube_fallback_map.json              ← Spotify ID → YouTube URL 知识库
 └── Playlists/
     ├── summer26/
     │   ├── summer26.spotdl           ← Summer 26 追踪文件
@@ -208,3 +211,77 @@ sudo /usr/local/bin/docker run --rm \
 
 Bot 的 Token 和 Chat ID 存储在 `check_cookie.sh` 中，不在此处记录。
 需要修改通知目标时，直接编辑 `/volume1/homes/Mia/Music/check_cookie.sh`。
+
+---
+
+## Fallback 下载系统
+
+### 背景
+
+约 6% 的歌曲 spotdl 无法自动匹配（LookupError / AudioProviderError），但这些歌曲绝大多数在 YouTube 上存在。通过"YouTube 二层解析器"解决此问题，无需引入 Bilibili / SoundCloud 等新平台。
+
+### 核心机制
+
+```bash
+# spotdl 混合模式：YouTube 提供音频，Spotify 提供元数据
+spotdl download "YouTubeURL|SpotifyURL" --output "{artists}/{album}/{title}"
+```
+
+下载结果与正常 spotdl 下载**完全一致**（Artist / Album / Cover / WOAS 标签）。
+
+### 关键文件
+
+| 文件 | 说明 |
+|------|------|
+| `youtube_fallback_map.json` | Spotify Track ID → YouTube URL 永久知识库 |
+| `fallback_download.py` | Fallback 下载脚本（Docker 容器内运行） |
+
+### youtube_fallback_map.json 结构
+
+```json
+{
+  "spotify_track_id": {
+    "youtube_url": "https://www.youtube.com/watch?v=...",
+    "song_name": "Artist - Title",
+    "spotify_url": "https://open.spotify.com/track/...",
+    "source": "manual",
+    "verified": true,
+    "created_at": "2026-06-26T00:00:00Z",
+    "verified_at": "2026-06-26T00:00:00Z"
+  }
+}
+```
+
+- `source`: `"manual"`（人工验证）或 `"auto"`（脚本搜索）
+- `verified`: 仅在 spotdl 下载**成功**且 WOAS 验证通过后设为 `true`
+
+### 运行方式
+
+```bash
+# 在 NAS 上手动执行（Docker 容器内）
+sudo /usr/local/bin/docker run --rm \
+  -v /volume1/homes/Mia/Music:/music \
+  --entrypoint python3 \
+  spotdl-local:latest \
+  /music/fallback_download.py
+
+# 仅处理指定 ID
+sudo /usr/local/bin/docker run --rm \
+  -v /volume1/homes/Mia/Music:/music \
+  --entrypoint python3 \
+  spotdl-local:latest \
+  /music/fallback_download.py --ids=spotify_id1,spotify_id2
+
+# 预演（不下载）
+sudo /usr/local/bin/docker run --rm \
+  -v /volume1/homes/Mia/Music:/music \
+  --entrypoint python3 \
+  spotdl-local:latest \
+  /music/fallback_download.py --dry-run
+```
+
+### 实施阶段
+
+- **Phase 1（当前）**：手动维护 `youtube_fallback_map.json`，按需运行脚本
+- **Phase 2**（若每月失败 > 5 首）：在 `sync_liked.py` 内嵌 LookupError → yt-dlp 搜索 → fallback 下载逻辑
+- **Phase 3**（若 YouTube 真正缺失 > 10%）：评估新平台
