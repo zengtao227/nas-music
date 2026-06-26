@@ -319,7 +319,12 @@ def main() -> None:
         print(f"Fallback: {len(resolved)} pre-resolved URLs found, attempting hybrid download", flush=True)
         for sid, yt_url in resolved.items():
             spotify_url = f"https://open.spotify.com/track/{sid}"
-            spotdl("download", f"{yt_url}|{spotify_url}", "--output", OUTPUT_TEMPLATE)
+            rc = spotdl("download", f"{yt_url}|{spotify_url}", "--output", OUTPUT_TEMPLATE)
+            if rc != 0:
+                # WHY: log failure explicitly so the log file is the audit trail.
+                # The song remains in missing_ids.json and will be retried on the
+                # next cron cycle — no separate retry queue is needed.
+                print(f"  ⚠️  Fallback FAILED (rc={rc}): {sid} — {yt_url}", flush=True)
 
     # Write missing_ids.json snapshot (still-missing after all paths)
     local_ids_final = scan_local_spotify_ids()
