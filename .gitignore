@@ -4,6 +4,7 @@ youtube_fallback_cache.json
 .resolver_test.log
 .resolver_live.log
 .collision_audit.jsonl
+.jellyfin_api_key
 __pycache__/
 *.pyc
 *.pyo
