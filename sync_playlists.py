@@ -383,20 +383,32 @@ def indent_xml(elem: ET.Element, level: int = 0) -> None:
 def notify_jellyfin_refresh(jellyfin_id: str) -> None:
     """Tell Jellyfin to reload the playlist so Finamp sees the new item count immediately."""
     if not JELLYFIN_API_KEY_FILE.exists():
+        print(
+            f"WARNING: Jellyfin refresh skipped: key file missing ({JELLYFIN_API_KEY_FILE})",
+            flush=True,
+        )
         return
-    api_key = JELLYFIN_API_KEY_FILE.read_text().strip()
+    try:
+        api_key = JELLYFIN_API_KEY_FILE.read_text().strip()
+    except OSError as exc:
+        print(
+            f"WARNING: Jellyfin refresh skipped: cannot read key file: {exc}",
+            flush=True,
+        )
+        return
     if not api_key:
+        print("WARNING: Jellyfin refresh skipped: key file is empty", flush=True)
         return
     url = (
         f"{JELLYFIN_URL}/Items/{jellyfin_id}/Refresh"
-        f"?api_key={api_key}"
-        f"&MetadataRefreshMode=Default"
+        f"?MetadataRefreshMode=Default"
         f"&ImageRefreshMode=Default"
         f"&ReplaceAllImages=false"
         f"&ReplaceAllMetadata=false"
     )
     try:
         req = urllib.request.Request(url, method="POST")
+        req.add_header("X-MediaBrowser-Token", api_key)
         req.add_header("Content-Length", "0")
         urllib.request.urlopen(req, timeout=5)
         print(f"Jellyfin refresh triggered: {jellyfin_id}", flush=True)
