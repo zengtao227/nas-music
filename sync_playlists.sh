@@ -3,9 +3,8 @@ MUSIC_DIR="/volume1/homes/Mia/Music"
 LOG_FILE="$MUSIC_DIR/.spotdl_playlists_sync.log"
 LOCKFILE="/tmp/spotdl_playlists_sync.lock"
 
-[ -f "$LOCKFILE" ] && exit 0
-touch "$LOCKFILE"
-trap "rm -f $LOCKFILE" EXIT
+exec 9>"$LOCKFILE"
+flock -n 9 || exit 0
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Playlist sync started" >> "$LOG_FILE"
 

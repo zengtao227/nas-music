@@ -112,7 +112,7 @@ def load_fallback_map() -> dict[str, str]:
 
         has_new_fields = "confidence" in entry and bool(entry.get("resolved_at"))
         if has_new_fields:
-            if entry.get("confidence", 0) < 0.35:
+            if float(entry.get("confidence") or 0) < 0.35:
                 continue
             try:
                 ts = datetime.datetime.fromisoformat(
@@ -226,6 +226,10 @@ def repair_stale_woas_matches(
     id_to_song = {s["song_id"]: s for s in songs if s.get("song_id") in missing_ids}
     candidates_by_key = build_file_key_to_paths(folder)
 
+    # WHY: track retagged paths so two missing IDs sharing the same normalized key
+    # don't both claim the same file in one pass. The second ID stays missing and
+    # falls through to metadata_collision_satisfied_ids instead.
+    retagged_paths: set[pathlib.Path] = set()
     for sid in sorted(missing_ids):
         song = id_to_song.get(sid)
         if not song:
@@ -233,13 +237,16 @@ def repair_stale_woas_matches(
         candidates = [
             (mp3, current_id)
             for mp3, current_id in candidates_by_key.get(normalized_song_key(song), [])
-            if current_id != sid and current_id not in tracked_ids
+            if current_id != sid
+            and current_id not in tracked_ids
+            and mp3 not in retagged_paths
         ]
         if len(candidates) != 1:
             continue
 
         mp3, old_id = candidates[0]
         if set_file_song_id(mp3, sid):
+            retagged_paths.add(mp3)
             old_label = old_id or "no-WOAS"
             print(
                 f"Repair: corrected playlist WOAS for {mp3.name} ({old_label} -> {sid})",
@@ -407,7 +414,14 @@ def rebuild_jellyfin_playlist(pl: dict, folder: pathlib.Path, songs: list) -> No
         else:
             missing_ids.append(sid)
 
-    tree = ET.parse(xml_path)
+    try:
+        tree = ET.parse(xml_path)
+    except ET.ParseError as exc:
+        print(
+            f"WARNING: Jellyfin playlist XML corrupt for '{jellyfin_name}', skipping rebuild: {exc}",
+            flush=True,
+        )
+        return
     root = tree.getroot()
     old_items = root.find("PlaylistItems")
     if old_items is not None:
@@ -464,7 +478,15 @@ def sync_playlist(login: spotapi.Login, pl: dict) -> None:
         missing_tracked_ids -= metadata_collision_satisfied_ids(
             folder, missing_tracked_ids, songs
         )
-        repair_stale_woas_matches(folder, missing_tracked_ids, songs)
+        still_missing_after_repair = repair_stale_woas_matches(
+            folder, missing_tracked_ids, songs
+        )
+        if still_missing_after_repair:
+            print(
+                f"WARNING: {len(still_missing_after_repair)} tracked playlist files"
+                " still missing (snapshot incomplete, skipping retry)",
+                flush=True,
+            )
         rebuild_jellyfin_playlist(pl, folder, songs)
         return
 
@@ -506,11 +528,7 @@ def sync_playlist(login: spotapi.Login, pl: dict) -> None:
                 # songs truly landed. Only roll back IDs that have no corresponding file.
                 # This prevents "one bad song" from blocking 19 good ones in the batch,
                 # and avoids orphaned files that would never be cleaned up.
-                actually_downloaded = set()
-                for mp3 in folder.rglob("*.mp3"):
-                    sid = song_id_from_file(mp3)
-                    if sid:
-                        actually_downloaded.add(sid)
+                actually_downloaded = set(build_disk_id_to_path(folder))
 
                 batch_ids_set = {s["song_id"] for s in batch_new if "song_id" in s}
                 failed_ids = batch_ids_set - actually_downloaded
@@ -543,9 +561,10 @@ def sync_playlist(login: spotapi.Login, pl: dict) -> None:
     # Guard wraps both prune and delete: an implausibly large count means the
     # snapshot is broken, so we touch nothing and let the next run self-heal.
     if removed_ids:
-        if len(removed_ids) > MAX_DELETIONS:
+        deletion_limit = max(MAX_DELETIONS, int(0.3 * len(saved_ids)))
+        if len(removed_ids) > deletion_limit:
             print(
-                f"WARNING: {len(removed_ids)} removals exceeds limit ({MAX_DELETIONS}) — "
+                f"WARNING: {len(removed_ids)} removals exceeds limit ({deletion_limit}) — "
                 "snapshot likely incomplete, skipping deletion this run",
                 flush=True,
             )

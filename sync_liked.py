@@ -366,7 +366,7 @@ def load_fallback_map() -> dict[str, str]:
         has_new_fields = "confidence" in entry and bool(entry.get("resolved_at"))
         if has_new_fields:
             # rule 3: new resolver format — apply confidence + TTL
-            if entry.get("confidence", 0) < 0.35:
+            if float(entry.get("confidence") or 0) < 0.35:
                 continue
             try:
                 ts = datetime.datetime.fromisoformat(
