@@ -16,6 +16,7 @@ import datetime
 import json
 import pathlib
 import subprocess
+import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Any
 
@@ -28,6 +29,8 @@ SP_DC_FILE = MUSIC_DIR / ".spotify_sp_dc"
 FALLBACK_MAP_FILE = MUSIC_DIR / "youtube_fallback_cache.json"
 JELLYFIN_PLAYLISTS_DIR = pathlib.Path("/jellyfin_playlists")
 JELLYFIN_MUSIC_PREFIX = "/media/music"
+JELLYFIN_URL = "http://192.168.68.68:8096"
+JELLYFIN_API_KEY_FILE = MUSIC_DIR / ".jellyfin_api_key"
 OUTPUT_BASE = "Playlists"
 BATCH_SIZE = 20
 
@@ -42,12 +45,14 @@ PLAYLISTS = [
         "name": "summer26",
         "folder": "summer26",
         "jellyfin_name": "Summer 26",
+        "jellyfin_id": "ed82387a29c7bf3d4703b7d964d94c54",
     },
     {
         "id": "2Rx94JQDRIft0V4Fd9rMq5",
         "name": "can_dances",
         "folder": "can_dances",
         "jellyfin_name": "Can Dances",
+        "jellyfin_id": "313dc8185ed60db38a6a6b42e2321835",
     },
 ]
 
@@ -375,6 +380,30 @@ def indent_xml(elem: ET.Element, level: int = 0) -> None:
         elem.tail = pad
 
 
+def notify_jellyfin_refresh(jellyfin_id: str) -> None:
+    """Tell Jellyfin to reload the playlist so Finamp sees the new item count immediately."""
+    if not JELLYFIN_API_KEY_FILE.exists():
+        return
+    api_key = JELLYFIN_API_KEY_FILE.read_text().strip()
+    if not api_key:
+        return
+    url = (
+        f"{JELLYFIN_URL}/Items/{jellyfin_id}/Refresh"
+        f"?api_key={api_key}"
+        f"&MetadataRefreshMode=Default"
+        f"&ImageRefreshMode=Default"
+        f"&ReplaceAllImages=false"
+        f"&ReplaceAllMetadata=false"
+    )
+    try:
+        req = urllib.request.Request(url, method="POST")
+        req.add_header("Content-Length", "0")
+        urllib.request.urlopen(req, timeout=5)
+        print(f"Jellyfin refresh triggered: {jellyfin_id}", flush=True)
+    except Exception as exc:
+        print(f"WARNING: Jellyfin refresh failed for {jellyfin_id}: {exc}", flush=True)
+
+
 def rebuild_jellyfin_playlist(pl: dict, folder: pathlib.Path, songs: list) -> None:
     """Rewrite Jellyfin's playlist XML from actual MP3 files every sync run."""
     jellyfin_name = pl.get("jellyfin_name", pl["name"])
@@ -442,6 +471,9 @@ def rebuild_jellyfin_playlist(pl: dict, folder: pathlib.Path, songs: list) -> No
         f", {collision_reused} metadata collisions reused)",
         flush=True,
     )
+    jellyfin_id = pl.get("jellyfin_id", "")
+    if jellyfin_id:
+        notify_jellyfin_refresh(jellyfin_id)
 
 
 def sync_playlist(login: spotapi.Login, pl: dict) -> None:
