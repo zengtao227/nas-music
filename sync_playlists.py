@@ -486,6 +486,11 @@ def rebuild_jellyfin_playlist(pl: dict, folder: pathlib.Path, songs: list) -> No
     jellyfin_id = pl.get("jellyfin_id", "")
     if jellyfin_id:
         notify_jellyfin_refresh(jellyfin_id)
+    else:
+        print(
+            f"WARNING: Jellyfin refresh skipped for '{jellyfin_name}': jellyfin_id not configured",
+            flush=True,
+        )
 
 
 def sync_playlist(login: spotapi.Login, pl: dict) -> None:
