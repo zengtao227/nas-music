@@ -108,7 +108,9 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 | Summer 26 | `ed82387a29c7bf3d4703b7d964d94c54` |
 | Can Dances | `313dc8185ed60db38a6a6b42e2321835` |
 
-**注意**：新歌加入歌单后，sync_playlists.py 会下载文件、Jellyfin 实时扫描会将其入库，但 Jellyfin 播放列表不会自动更新。如需更新播放列表，需重新调用 Jellyfin API（见下方 API 操作记录）。
+**注意**：`sync_playlists.sh` 会把 Jellyfin playlist XML 目录挂载到容器内的 `/jellyfin_playlists`，`sync_playlists.py` 每次运行结束都会按 `.spotdl` 顺序和实际存在的 MP3 自动重建 Jellyfin 播放列表 XML。Finamp 的 Playlists 标签不依赖手动重建；若手机端仍显示旧数量，优先在 Finamp 内重新连接刷新缓存。
+
+当两个 Spotify Track ID 指向同一首同艺术家/同专辑/同标题的音频时，本地只保留一个 MP3，Jellyfin playlist XML 会复用同一个路径写出多个播放列表条目，避免 spotDL 因同名文件重复跳过而进入无限重试。
 
 ### Jellyfin API 操作
 

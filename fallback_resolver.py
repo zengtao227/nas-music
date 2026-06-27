@@ -30,13 +30,19 @@ MISSING_IDS_FILE = MUSIC_DIR / "missing_ids.json"
 # ---------------------------------------------------------------------------
 # Tunable constants
 # ---------------------------------------------------------------------------
-DURATION_TOLERANCE = 0.15       # ±15% duration tolerance
-MIN_SCORE_THRESHOLD = 0.4       # candidates below this score are rejected
-CACHE_TTL_DAYS = 90             # entries older than this are re-resolved
-NOISE_KEYWORDS = [              # penalise these unless in the Spotify title
-    "cover", "karaoke", "remix", "live", "slowed", "reverb", "8d",
+DURATION_TOLERANCE = 0.15  # ±15% duration tolerance
+MIN_SCORE_THRESHOLD = 0.4  # candidates below this score are rejected
+CACHE_TTL_DAYS = 90  # entries older than this are re-resolved
+NOISE_KEYWORDS = [  # penalise these unless in the Spotify title
+    "cover",
+    "karaoke",
+    "remix",
+    "live",
+    "slowed",
+    "reverb",
+    "8d",
 ]
-NOISE_PENALTY = 0.35            # score deducted per noise keyword matched
+NOISE_PENALTY = 0.35  # score deducted per noise keyword matched
 
 
 # ---------------------------------------------------------------------------
@@ -63,9 +69,19 @@ def save_json(path: pathlib.Path, data: dict) -> None:
 
 
 def is_cache_valid(entry: dict | None) -> bool:
-    """Return True if the cache entry exists and is not older than CACHE_TTL_DAYS."""
+    """Return True if the cache entry exists and is not older than CACHE_TTL_DAYS.
+
+    Manual verified entries (source=manual with verified=true or no verified field)
+    are always considered valid regardless of age, as they represent human-verified
+    ground truth.
+    """
     if not entry or not entry.get("youtube_url"):
         return False
+
+    # Manual verified entries never expire
+    if entry.get("source") == "manual" and entry.get("verified") is not False:
+        return True
+
     resolved_at = entry.get("resolved_at", "")
     if not resolved_at:
         return False
@@ -101,18 +117,23 @@ def search_youtube_candidates(query: str) -> list[dict]:
                 continue
             try:
                 info = json.loads(line)
-                candidates.append({
-                    "title": info.get("title", ""),
-                    "url": (
-                        info.get("webpage_url")
-                        or f"https://www.youtube.com/watch?v={info.get('id')}"
-                    ),
-                    "duration": info.get("duration", 0),
-                })
+                candidates.append(
+                    {
+                        "title": info.get("title", ""),
+                        "url": (
+                            info.get("webpage_url")
+                            or f"https://www.youtube.com/watch?v={info.get('id')}"
+                        ),
+                        "duration": info.get("duration", 0),
+                    }
+                )
             except json.JSONDecodeError:
                 continue
         if not candidates and res.returncode != 0:
-            print(f"  ⚠️  yt-dlp returned no results (rc={res.returncode}) for '{query}'", flush=True)
+            print(
+                f"  ⚠️  yt-dlp returned no results (rc={res.returncode}) for '{query}'",
+                flush=True,
+            )
         return candidates
     except Exception as exc:
         print(f"  ⚠️  yt-dlp search failed for '{query}': {exc}", flush=True)
@@ -158,16 +179,12 @@ def score_candidate(
     return max(0.0, score)
 
 
-def resolve_url(
-    spotify_id: str, liked_songs: list
-) -> tuple[str | None, float, dict]:
+def resolve_url(spotify_id: str, liked_songs: list) -> tuple[str | None, float, dict]:
     """
     Pure function: Spotify ID → (youtube_url | None, best_score, best_candidate).
     No side effects beyond returning values.
     """
-    metadata = next(
-        (s for s in liked_songs if s.get("song_id") == spotify_id), None
-    )
+    metadata = next((s for s in liked_songs if s.get("song_id") == spotify_id), None)
     if not metadata:
         return None, 0.0, {}
 
@@ -232,7 +249,9 @@ def main() -> None:
 
     missing_ids: list[str] = load_json(MISSING_IDS_FILE)  # type: ignore[assignment]
     if not isinstance(missing_ids, list) or not missing_ids:
-        print("No missing IDs found in missing_ids.json. Nothing to resolve.", flush=True)
+        print(
+            "No missing IDs found in missing_ids.json. Nothing to resolve.", flush=True
+        )
         return
 
     if ids_filter:
@@ -244,9 +263,13 @@ def main() -> None:
     print(f"Missing IDs to resolve: {len(missing_ids)}", flush=True)
 
     # 2. Load liked.spotdl for metadata
-    liked_songs = load_json(SAVE_FILE)
-    if isinstance(liked_songs, dict):
-        liked_songs = liked_songs.get("songs", [])
+    liked_songs_raw = load_json(SAVE_FILE)
+    if isinstance(liked_songs_raw, dict):
+        liked_songs = liked_songs_raw.get("songs", [])
+    elif isinstance(liked_songs_raw, list):
+        liked_songs = liked_songs_raw
+    else:
+        liked_songs = []
 
     # 3. Load existing cache
     cache: dict = load_json(CACHE_FILE)  # type: ignore[assignment]
@@ -260,7 +283,7 @@ def main() -> None:
     for idx, sid in enumerate(missing_ids, 1):
         metadata = next((s for s in liked_songs if s.get("song_id") == sid), None)
         label = (
-            f"{metadata.get('artist','')} - {metadata.get('name','')}"
+            f"{metadata.get('artist', '')} - {metadata.get('name', '')}"
             if metadata
             else sid
         )
@@ -280,7 +303,11 @@ def main() -> None:
                 # Low-confidence entries (score < 0.7) are probabilistic guesses.
                 spotify_dur = float(
                     next(
-                        (s.get("duration", 0) for s in liked_songs if s.get("song_id") == sid),
+                        (
+                            s.get("duration", 0)
+                            for s in liked_songs
+                            if s.get("song_id") == sid
+                        ),
                         0,
                     )
                 )

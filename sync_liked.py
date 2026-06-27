@@ -11,12 +11,14 @@ Architecture:
   5. api-path   → truly new songs: spotdl save (Spotify API) + download
   6. removed    → prune liked.spotdl then delete files
 """
+
 import datetime
 import json
 import pathlib
 import subprocess
 import time
 from collections import defaultdict
+from typing import Any
 
 import mutagen
 import spotapi
@@ -35,6 +37,7 @@ BATCH_SIZE = 50
 
 MAX_DELETIONS = 30
 
+
 def spotdl(*args: str) -> int:
     return subprocess.run(["spotdl", *args], cwd=str(MUSIC_DIR)).returncode
 
@@ -45,7 +48,10 @@ def spotdl_save_with_retry(*args: str, retries: int = 2, backoff: int = 30) -> i
         if rc == 0:
             return 0
         if attempt < retries:
-            print(f"spotdl save rc={rc}, retrying in {backoff}s ({attempt + 1}/{retries})", flush=True)
+            print(
+                f"spotdl save rc={rc}, retrying in {backoff}s ({attempt + 1}/{retries})",
+                flush=True,
+            )
             time.sleep(backoff)
     return rc
 
@@ -63,7 +69,8 @@ def song_id_from_file(mp3: pathlib.Path) -> str:
 
 def build_entry_from_disk(mp3: pathlib.Path, song_id: str) -> dict:
     """Build a liked.spotdl entry from on-disk ID3 tags — no Spotify API needed."""
-    def tag_str(tags: object, key: str) -> str:
+
+    def tag_str(tags: Any, key: str) -> str:
         val = tags.get(key) if tags else None
         if val is None:
             return ""
@@ -213,7 +220,9 @@ def cleanup_stale_conflicts(
             canonical_of_current = id_to_canonical_owner.get(current_id)
             is_canonical_owner = canonical_of_current == current_id
             # Unique liked song: in liked_ids_all but has no collision group.
-            is_unique_liked = current_id in liked_ids_all and current_id not in id_to_canonical_owner
+            is_unique_liked = (
+                current_id in liked_ids_all and current_id not in id_to_canonical_owner
+            )
 
             if is_canonical_owner or is_unique_liked:
                 continue
@@ -246,9 +255,7 @@ def _log_collision_decision(
         pass
 
 
-def resolve_path_collisions(
-    missing_ids: set[str], songs: list[dict]
-) -> set[str]:
+def resolve_path_collisions(missing_ids: set[str], songs: list[dict]) -> set[str]:
     """Return non-owner IDs that are always collision-satisfied (never downloaded).
 
     Ownership is deterministic: min(sorted sibling IDs) is the canonical owner.
@@ -256,7 +263,9 @@ def resolve_path_collisions(
     identical on every replay.  Each decision is appended to COLLISION_AUDIT_FILE.
     """
     collision_groups = build_collision_groups(songs)
-    non_owner_ids: set[str] = {sid for ids in collision_groups.values() for sid in ids[1:]}
+    non_owner_ids: set[str] = {
+        sid for ids in collision_groups.values() for sid in ids[1:]
+    }
     satisfied = missing_ids & non_owner_ids
 
     for group_key, group_ids in collision_groups.items():
@@ -301,7 +310,10 @@ def get_liked_ids() -> tuple[set[str], bool]:
     # was interrupted (network cut, API bug, spotapi parsing failure). Raise so
     # the caller aborts the run — prevents spurious removals on a partial snapshot.
     if declared_total is None:
-        print("WARNING: Spotify did not return totalCount — heuristic guard active", flush=True)
+        print(
+            "WARNING: Spotify did not return totalCount — heuristic guard active",
+            flush=True,
+        )
     elif len(ids) < declared_total:
         raise RuntimeError(
             f"Incomplete Spotify fetch: got {len(ids)}, declared {declared_total} "
@@ -409,7 +421,11 @@ def delete_files_for_ids(removed_ids: set[str]) -> int:
             mp3.unlink()
             deleted += 1
             for parent in (mp3.parent, mp3.parent.parent):
-                if parent != MUSIC_DIR and parent.is_dir() and not any(parent.iterdir()):
+                if (
+                    parent != MUSIC_DIR
+                    and parent.is_dir()
+                    and not any(parent.iterdir())
+                ):
                     parent.rmdir()
     return deleted
 
@@ -429,7 +445,11 @@ def main() -> None:
     # returned totalCount, get_liked_ids() already verified completeness via the
     # declared count — applying a second 80% check would reject legitimate large
     # unlikes (e.g. Mia removes 25% of her library in one go).
-    if total_count_absent and saved_ids and len(current_ids) < int(0.8 * len(saved_ids)):
+    if (
+        total_count_absent
+        and saved_ids
+        and len(current_ids) < int(0.8 * len(saved_ids))
+    ):
         print(
             f"WARNING: liked snapshot too small ({len(current_ids)} vs {len(saved_ids)} saved) — "
             "possible pagination failure, aborting",
@@ -455,21 +475,42 @@ def main() -> None:
             if new_from_disk:
                 songs = songs + new_from_disk
                 write_save_file(songs)
-                print(f"Disk-path: {len(new_from_disk)} songs from ID3 tags (0 API calls)", flush=True)
+                print(
+                    f"Disk-path: {len(new_from_disk)} songs from ID3 tags (0 API calls)",
+                    flush=True,
+                )
             added_ids -= set(disk_hits.keys())
 
         # --- path 2: downloads.spotdl fast-path (copy metadata, zero API calls) ---
+        # WHY: We can reuse metadata from downloads.spotdl, BUT we must verify the
+        # file actually exists in the root directory before skipping download. An ID
+        # in downloads.spotdl might come from a playlist download or be a stale entry.
         if added_ids:
             downloads_map = load_downloads_map()
-            fast_ids = added_ids & set(downloads_map.keys())
+            fast_ids_candidates = added_ids & set(downloads_map.keys())
+            # Only use downloads.spotdl metadata if the file ALSO exists on disk in root
+            fast_ids = fast_ids_candidates & set(id_to_path.keys())
             if fast_ids:
                 known = {s["song_id"] for s in songs}
-                new_from_downloads = [downloads_map[sid] for sid in fast_ids if sid not in known]
+                new_from_downloads = [
+                    downloads_map[sid] for sid in fast_ids if sid not in known
+                ]
                 if new_from_downloads:
                     songs = songs + new_from_downloads
                     write_save_file(songs)
-                    print(f"DL-path: {len(new_from_downloads)} songs from downloads.spotdl (0 API calls)", flush=True)
+                    print(
+                        f"DL-path: {len(new_from_downloads)} songs from downloads.spotdl (0 API calls)",
+                        flush=True,
+                    )
                 added_ids -= fast_ids
+
+            # IDs in downloads.spotdl but not on disk still need download
+            stale_in_global = fast_ids_candidates - fast_ids
+            if stale_in_global:
+                print(
+                    f"DL-path: {len(stale_in_global)} IDs in downloads.spotdl but file missing, will download",
+                    flush=True,
+                )
 
         # --- path 3: API path — truly new songs not on disk or in downloads.spotdl ---
         if added_ids:
@@ -477,17 +518,27 @@ def main() -> None:
             local_ids = set(id_to_path.keys())
             id_list = list(added_ids)
             total = (len(id_list) + BATCH_SIZE - 1) // BATCH_SIZE
-            print(f"API-path: {len(added_ids)} songs need Spotify metadata ({total} batches)", flush=True)
+            print(
+                f"API-path: {len(added_ids)} songs need Spotify metadata ({total} batches)",
+                flush=True,
+            )
 
             for i in range(0, len(id_list), BATCH_SIZE):
                 batch_ids = id_list[i : i + BATCH_SIZE]
                 n = i // BATCH_SIZE + 1
-                missing_ids = [sid for sid in batch_ids if sid not in local_ids]
-                print(f"Batch {n}/{total}: {len(batch_ids)} songs, missing {len(missing_ids)}", flush=True)
+                batch_missing_ids = [sid for sid in batch_ids if sid not in local_ids]
+                print(
+                    f"Batch {n}/{total}: {len(batch_ids)} songs, missing {len(batch_missing_ids)}",
+                    flush=True,
+                )
 
-                urls_all = [f"https://open.spotify.com/track/{sid}" for sid in batch_ids]
+                urls_all = [
+                    f"https://open.spotify.com/track/{sid}" for sid in batch_ids
+                ]
                 BATCH_FILE.unlink(missing_ok=True)
-                rc = spotdl_save_with_retry("save", *urls_all, "--save-file", str(BATCH_FILE))
+                rc = spotdl_save_with_retry(
+                    "save", *urls_all, "--save-file", str(BATCH_FILE)
+                )
                 if rc != 0 or not BATCH_FILE.exists():
                     print(f"Batch {n}: save failed (rc={rc}), skipping", flush=True)
                     BATCH_FILE.unlink(missing_ok=True)
@@ -496,11 +547,16 @@ def main() -> None:
                 songs = merge_batch_file(songs)
                 write_save_file(songs)
 
-                if missing_ids:
-                    urls_missing = [f"https://open.spotify.com/track/{sid}" for sid in missing_ids]
+                if batch_missing_ids:
+                    urls_missing = [
+                        f"https://open.spotify.com/track/{sid}"
+                        for sid in batch_missing_ids
+                    ]
                     spotdl("download", *urls_missing, "--output", OUTPUT_TEMPLATE)
                 else:
-                    print(f"Batch {n}: all already on disk, download skipped", flush=True)
+                    print(
+                        f"Batch {n}: all already on disk, download skipped", flush=True
+                    )
 
     # --- remove unliked songs ---
     if removed_ids:
@@ -528,7 +584,9 @@ def main() -> None:
     id_to_canonical_owner: dict[str, str] = {
         sid: ids[0] for ids in collision_groups.values() for sid in ids
     }
-    non_owner_ids: set[str] = {sid for ids in collision_groups.values() for sid in ids[1:]}
+    non_owner_ids: set[str] = {
+        sid for ids in collision_groups.values() for sid in ids[1:]
+    }
 
     # WHY: remove stale-WOAS placeholders that cause spotdl to skip downloads.
     # With deterministic ownership, non-owner siblings are also removed to let
@@ -538,13 +596,20 @@ def main() -> None:
     fallback_map = load_fallback_map()
     # Non-owners are never downloaded — canonical owner represents the entire group.
     download_candidates = missing_ids - non_owner_ids
-    resolved = {sid: fallback_map[sid] for sid in download_candidates if sid in fallback_map}
+    resolved = {
+        sid: fallback_map[sid] for sid in download_candidates if sid in fallback_map
+    }
 
     if resolved:
-        print(f"Fallback: {len(resolved)} pre-resolved URLs found, attempting hybrid download", flush=True)
+        print(
+            f"Fallback: {len(resolved)} pre-resolved URLs found, attempting hybrid download",
+            flush=True,
+        )
         for sid, yt_url in resolved.items():
             spotify_url = f"https://open.spotify.com/track/{sid}"
-            rc = spotdl("download", f"{yt_url}|{spotify_url}", "--output", OUTPUT_TEMPLATE)
+            rc = spotdl(
+                "download", f"{yt_url}|{spotify_url}", "--output", OUTPUT_TEMPLATE
+            )
             if rc != 0:
                 print(f"  ⚠️  Fallback FAILED (rc={rc}): {sid} — {yt_url}", flush=True)
 
@@ -554,11 +619,16 @@ def main() -> None:
     collision_satisfied = resolve_path_collisions(truly_missing, songs)
     still_missing = list(truly_missing - collision_satisfied)
     if collision_satisfied:
-        print(f"Collision-satisfied: {len(collision_satisfied)} IDs covered by canonical owners", flush=True)
+        print(
+            f"Collision-satisfied: {len(collision_satisfied)} IDs covered by canonical owners",
+            flush=True,
+        )
     tmp = MISSING_IDS_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(still_missing))
     tmp.replace(MISSING_IDS_FILE)
-    print(f"missing_ids.json: {len(still_missing)} unresolved songs written", flush=True)
+    print(
+        f"missing_ids.json: {len(still_missing)} unresolved songs written", flush=True
+    )
 
     print("Done.", flush=True)
 
