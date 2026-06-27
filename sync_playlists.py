@@ -31,6 +31,7 @@ JELLYFIN_PLAYLISTS_DIR = pathlib.Path("/jellyfin_playlists")
 JELLYFIN_MUSIC_PREFIX = "/media/music"
 JELLYFIN_URL = "http://192.168.68.68:8096"
 JELLYFIN_API_KEY_FILE = MUSIC_DIR / ".jellyfin_api_key"
+JELLYFIN_MIA_USER_ID = "9DBDBD21-920F-49E0-86B0-AC5D26D2C63B"
 OUTPUT_BASE = "Playlists"
 BATCH_SIZE = 20
 
@@ -380,43 +381,135 @@ def indent_xml(elem: ET.Element, level: int = 0) -> None:
         elem.tail = pad
 
 
-def notify_jellyfin_refresh(jellyfin_id: str) -> None:
-    """Tell Jellyfin to reload the playlist so Finamp sees the new item count immediately."""
+def _load_jellyfin_api_key() -> str:
+    """Load Jellyfin API key from file; returns empty string on any failure."""
     if not JELLYFIN_API_KEY_FILE.exists():
         print(
-            f"WARNING: Jellyfin refresh skipped: key file missing ({JELLYFIN_API_KEY_FILE})",
+            f"WARNING: Jellyfin API key file missing ({JELLYFIN_API_KEY_FILE})",
             flush=True,
         )
-        return
+        return ""
     try:
-        api_key = JELLYFIN_API_KEY_FILE.read_text().strip()
+        key = JELLYFIN_API_KEY_FILE.read_text().strip()
     except OSError as exc:
+        print(f"WARNING: Cannot read Jellyfin API key: {exc}", flush=True)
+        return ""
+    if not key:
+        print("WARNING: Jellyfin API key file is empty", flush=True)
+        return ""
+    return key
+
+
+def _jellyfin_api(
+    method: str, path: str, api_key: str, body: dict | None = None
+) -> dict | None:
+    """Make a Jellyfin API call; returns parsed JSON dict or None on any error."""
+    url = f"{JELLYFIN_URL}{path}"
+    data = json.dumps(body).encode() if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("X-MediaBrowser-Token", api_key)
+    req.add_header("Content-Type", "application/json")
+    if data is None:
+        req.add_header("Content-Length", "0")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw.strip() else {}
+    except Exception as exc:
+        print(f"WARNING: Jellyfin API {method} {path} failed: {exc}", flush=True)
+        return None
+
+
+def _jellyfin_find_playlist_id(jellyfin_name: str, api_key: str) -> str | None:
+    """Search for a Jellyfin playlist by exact name.
+
+    Returns the ID if found, "" if confirmed absent, None if the API call failed.
+    Callers must treat None as "API error — do not create" to prevent duplicates.
+    """
+    path = (
+        f"/Items?IncludeItemTypes=Playlist&Recursive=true&UserId={JELLYFIN_MIA_USER_ID}"
+    )
+    result = _jellyfin_api("GET", path, api_key)
+    if result is None:
+        return None
+    for item in result.get("Items", []):
+        if item.get("Name") == jellyfin_name:
+            return str(item["Id"])
+    return ""
+
+
+def _jellyfin_create_playlist(jellyfin_name: str, api_key: str) -> str:
+    """Create a Jellyfin playlist owned by Mia; returns the new ID or "" on failure."""
+    body = {
+        "Name": jellyfin_name,
+        "Ids": [],
+        "UserId": JELLYFIN_MIA_USER_ID,
+        "MediaType": "Audio",
+    }
+    result = _jellyfin_api("POST", "/Playlists", api_key, body)
+    return str(result["Id"]) if result and result.get("Id") else ""
+
+
+def get_or_create_jellyfin_id(pl: dict, api_key: str) -> str:
+    """Return the Jellyfin playlist ID for pl, creating the playlist if absent.
+
+    Returns "" when the ID cannot be determined this run (API error, just created,
+    or no api_key). The caller skips the XML rebuild on "" and retries next run.
+    Hardcoded jellyfin_id in pl is used as-is with zero network calls.
+    """
+    hardcoded = pl.get("jellyfin_id", "")
+    if hardcoded:
+        return hardcoded
+    if not api_key:
+        return ""
+    jellyfin_name = pl.get("jellyfin_name", pl["name"])
+    found = _jellyfin_find_playlist_id(jellyfin_name, api_key)
+    if found is None:
+        # API error — do NOT create (would risk duplicates on transient failures)
         print(
-            f"WARNING: Jellyfin refresh skipped: cannot read key file: {exc}",
+            f"WARNING: Jellyfin playlist lookup failed for '{jellyfin_name}',"
+            " skipping rebuild this run",
             flush=True,
         )
-        return
+        return ""
+    if found:
+        return found
+    # Confirmed absent — create it; populate XML on the next run
+    new_id = _jellyfin_create_playlist(jellyfin_name, api_key)
+    if new_id:
+        print(
+            f"Jellyfin playlist '{jellyfin_name}' created ({new_id})"
+            " — XML will be populated on next run",
+            flush=True,
+        )
+    else:
+        print(
+            f"WARNING: Jellyfin playlist creation failed for '{jellyfin_name}'",
+            flush=True,
+        )
+    return ""
+
+
+def notify_jellyfin_refresh(jellyfin_id: str, api_key: str) -> None:
+    """Tell Jellyfin to reload the playlist so Finamp sees the new item count immediately."""
     if not api_key:
-        print("WARNING: Jellyfin refresh skipped: key file is empty", flush=True)
         return
-    url = (
-        f"{JELLYFIN_URL}/Items/{jellyfin_id}/Refresh"
+    result = _jellyfin_api(
+        "POST",
+        f"/Items/{jellyfin_id}/Refresh"
         f"?MetadataRefreshMode=Default"
         f"&ImageRefreshMode=Default"
         f"&ReplaceAllImages=false"
-        f"&ReplaceAllMetadata=false"
+        f"&ReplaceAllMetadata=false",
+        api_key,
     )
-    try:
-        req = urllib.request.Request(url, method="POST")
-        req.add_header("X-MediaBrowser-Token", api_key)
-        req.add_header("Content-Length", "0")
-        urllib.request.urlopen(req, timeout=5)
+    if result is not None:
         print(f"Jellyfin refresh triggered: {jellyfin_id}", flush=True)
-    except Exception as exc:
-        print(f"WARNING: Jellyfin refresh failed for {jellyfin_id}: {exc}", flush=True)
 
 
-def rebuild_jellyfin_playlist(pl: dict, folder: pathlib.Path, songs: list) -> None:
+def rebuild_jellyfin_playlist(
+    pl: dict, folder: pathlib.Path, songs: list, api_key: str
+) -> None:
     """Rewrite Jellyfin's playlist XML from actual MP3 files every sync run."""
     jellyfin_name = pl.get("jellyfin_name", pl["name"])
     xml_path = JELLYFIN_PLAYLISTS_DIR / jellyfin_name / "playlist.xml"
@@ -485,20 +578,19 @@ def rebuild_jellyfin_playlist(pl: dict, folder: pathlib.Path, songs: list) -> No
     )
     jellyfin_id = pl.get("jellyfin_id", "")
     if jellyfin_id:
-        notify_jellyfin_refresh(jellyfin_id)
-    else:
-        print(
-            f"WARNING: Jellyfin refresh skipped for '{jellyfin_name}': jellyfin_id not configured",
-            flush=True,
-        )
+        notify_jellyfin_refresh(jellyfin_id, api_key)
 
 
-def sync_playlist(login: spotapi.Login, pl: dict) -> None:
+def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
     folder = MUSIC_DIR / OUTPUT_BASE / pl["folder"]
     folder.mkdir(parents=True, exist_ok=True)
     save_file = folder / f"{pl['folder']}.spotdl"
     batch_file = folder / f"{pl['folder']}.batch.spotdl"
     output_template = f"{OUTPUT_BASE}/{pl['folder']}/{{artists}}/{{album}}/{{title}}"
+
+    jid = get_or_create_jellyfin_id(pl, api_key)
+    if jid:
+        pl["jellyfin_id"] = jid
 
     print(f"\n--- {pl['name']} ---", flush=True)
 
@@ -536,7 +628,8 @@ def sync_playlist(login: spotapi.Login, pl: dict) -> None:
                 " still missing (snapshot incomplete, skipping retry)",
                 flush=True,
             )
-        rebuild_jellyfin_playlist(pl, folder, songs)
+        if jid:
+            rebuild_jellyfin_playlist(pl, folder, songs, api_key)
         return
 
     # --- add new songs ---
@@ -642,11 +735,14 @@ def sync_playlist(login: spotapi.Login, pl: dict) -> None:
             flush=True,
         )
 
-    rebuild_jellyfin_playlist(pl, folder, songs)
+    if jid:
+        rebuild_jellyfin_playlist(pl, folder, songs, api_key)
 
 
 def main() -> None:
     print("=== Playlist Sync ===", flush=True)
+
+    api_key = _load_jellyfin_api_key()
 
     sp_dc = SP_DC_FILE.read_text().strip()
     cfg = spotapi.Config(logger=spotapi.NoopLogger())
@@ -654,7 +750,7 @@ def main() -> None:
     login = spotapi.Login.from_cookies(dump, cfg)
 
     for pl in PLAYLISTS:
-        sync_playlist(login, pl)
+        sync_playlist(login, pl, api_key)
 
     print("\nDone.", flush=True)
 
