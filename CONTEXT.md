@@ -66,9 +66,10 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 
 ### 私有歌单（每 5 分钟）
 
-同步 Mia 的两个私有 Spotify 歌单，支持歌单设为 private 状态下正常运作：
+同步 Mia 的私有 Spotify 歌单，支持歌单设为 private 状态下正常运作。当前同步的歌单在 `sync_playlists.py` 的 `PLAYLISTS` 列表中声明（Mia 告知 Tao 后添加）：
 - 新增歌曲 → 最多 5 分钟后下载到对应子目录
 - 删除歌曲 → 从歌单追踪文件中移除，本地文件同步删除
+- **新歌单**：见下方「如何添加新歌单」
 
 | 歌单 | Spotify ID | 本地目录 |
 |------|-----------|---------|
@@ -82,6 +83,62 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 | 日志 | `/volume1/homes/Mia/Music/.spotdl_playlists_sync.log` |
 
 **私有歌单认证方式**：`spotapi.PublicPlaylist(playlist_id, client=login.client)` — 将 sp_dc 认证后的 TLS client 注入 PublicPlaylist，使其可访问私有歌单。
+
+---
+
+### 如何添加新歌单
+
+Mia 告知 Tao 要添加某个 Spotify 歌单后，Tao 执行以下步骤：
+
+**第 1 步：找到 Spotify Playlist ID**
+
+从 Spotify 歌单分享链接中提取 ID：
+```
+https://open.spotify.com/playlist/3ebskb0Uy9zbm87SyemHjG
+                                    ↑ 这就是 ID
+```
+或在 Spotify 桌面端：右键歌单 → Share → Copy Link。
+
+**第 2 步：在 `sync_playlists.py` 中添加一行**
+
+打开 `/Users/zengtao/Doc/My code/nas-music/sync_playlists.py`，在 `PLAYLISTS` 列表中加入：
+
+```python
+{
+    "id": "spotify_playlist_id",   # 第 1 步获取的 ID
+    "name": "winter26",            # 用作日志标识符（英文小写+数字）
+    "folder": "winter26",          # NAS 上的子目录名（英文小写+数字）
+    "jellyfin_name": "Winter 26",  # Finamp 中显示的名称（可带空格和大写）
+},
+```
+
+**无需**填 `jellyfin_id` —— 脚本会自动在 Jellyfin 中创建对应播放列表。
+
+**第 3 步：提交并部署**
+
+```bash
+cd "/Users/zengtao/Doc/My code/nas-music"
+python3 -m py_compile sync_playlists.py && ruff check sync_playlists.py
+git add sync_playlists.py
+git commit -m "feat: add Winter 26 playlist"
+git push
+scp -O sync_playlists.py nas:/volume1/homes/Mia/Music/sync_playlists.py
+```
+
+**之后自动发生的事情（无需手动操作）：**
+
+| 时间 | 发生的事 |
+|------|---------|
+| 第 1 次 cron（≤5 分钟） | Jellyfin 中自动创建"Winter 26"播放列表；开始下载 Spotify 歌单中的歌曲 |
+| 第 2 次 cron（≤10 分钟） | Jellyfin 播放列表 XML 自动写入已下载的歌曲；触发 Jellyfin 缓存刷新 |
+| Finamp | Mia 的 Finamp "Playlists" 标签自动出现新歌单，无需任何手动操作 |
+
+**如果出现警告（需要 Tao 介入）：**
+- `WARNING: Jellyfin API ... failed` → Jellyfin 临时不可达，下次 cron 自动重试，无需操作
+- `WARNING: Jellyfin playlist creation failed` → 需检查 Jellyfin 状态和 API key
+- `WARNING: Jellyfin API key file missing` → 需在 NAS 上重新写入 `/volume1/homes/Mia/Music/.jellyfin_api_key`
+
+---
 
 ### Crontab（`/etc/crontab`）
 
@@ -101,14 +158,21 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 
 ### Jellyfin 播放列表
 
-已在 Jellyfin 中创建两个播放列表，Finamp 的 Playlists 标签可直接看到：
+`sync_playlists.sh` 把 Jellyfin playlist XML 目录挂载到容器内的 `/jellyfin_playlists`，`sync_playlists.py` 每次运行结束都会自动：
+1. 在 Jellyfin 中查找或创建对应播放列表（按 `jellyfin_name` 精确匹配）
+2. 按 `.spotdl` 顺序和实际存在的 MP3 重建 Jellyfin playlist XML
+3. 调用 Jellyfin API 触发缓存刷新，Finamp 立刻看到最新曲目数
 
-| 播放列表 | Jellyfin ID |
+若手机端仍显示旧数量，在 Finamp 设置中用「重新连接」刷新缓存（不要退出登录）。
+
+**当前播放列表**（在 `sync_playlists.py` PLAYLISTS 中声明，Jellyfin ID 由脚本自动发现）：
+
+| 播放列表 | Jellyfin ID（硬编码快速路径） |
 |---------|------------|
 | Summer 26 | `ed82387a29c7bf3d4703b7d964d94c54` |
 | Can Dances | `313dc8185ed60db38a6a6b42e2321835` |
 
-**注意**：`sync_playlists.sh` 会把 Jellyfin playlist XML 目录挂载到容器内的 `/jellyfin_playlists`，`sync_playlists.py` 每次运行结束都会按 `.spotdl` 顺序和实际存在的 MP3 自动重建 Jellyfin 播放列表 XML。Finamp 的 Playlists 标签不依赖手动重建；若手机端仍显示旧数量，优先在 Finamp 内重新连接刷新缓存。
+新增歌单无需填 Jellyfin ID，脚本会自动查找/创建（详见「如何添加新歌单」）。
 
 当两个 Spotify Track ID 指向同一首同艺术家/同专辑/同标题的音频时，本地只保留一个 MP3，Jellyfin playlist XML 会复用同一个路径写出多个播放列表条目，避免 spotDL 因同名文件重复跳过而进入无限重试。
 
