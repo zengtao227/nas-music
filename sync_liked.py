@@ -613,6 +613,22 @@ def main() -> None:
             if rc != 0:
                 print(f"  ⚠️  Fallback FAILED (rc={rc}): {sid} — {yt_url}", flush=True)
 
+    # Retry: direct spotdl download for songs without a cached fallback URL.
+    # Transient failures (Spotify metadata None, YT Music rate-limit, etc.) often
+    # resolve on the next attempt — don't leave them stuck in missing_ids.json.
+    retry_candidates = download_candidates - set(resolved)
+    if retry_candidates:
+        print(
+            f"Retry: {len(retry_candidates)} missing songs without cache,"
+            " re-running spotdl download",
+            flush=True,
+        )
+        urls = [
+            f"https://open.spotify.com/track/{sid}"
+            for sid in sorted(retry_candidates)
+        ]
+        spotdl("download", *urls, "--output", OUTPUT_TEMPLATE)
+
     # Write missing_ids.json snapshot (still-missing after all paths)
     local_ids_final = scan_local_spotify_ids()
     truly_missing = liked_ids_all - local_ids_final
