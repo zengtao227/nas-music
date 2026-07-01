@@ -34,6 +34,7 @@ JELLYFIN_API_KEY_FILE = MUSIC_DIR / ".jellyfin_api_key"
 JELLYFIN_MIA_USER_ID = "9DBDBD21-920F-49E0-86B0-AC5D26D2C63B"
 OUTPUT_BASE = "Playlists"
 BATCH_SIZE = 20
+DEEZER_ARL_FILE = MUSIC_DIR / ".deezer_arl"
 
 # Refuse to delete more than this many files from one playlist in a single run.
 # A few removals are real; dozens signal an incomplete snapshot (expired cookie
@@ -322,6 +323,100 @@ def delete_files_for_ids(folder: pathlib.Path, removed_ids: set[str]) -> int:
                 ):
                     parent.rmdir()
     return deleted
+
+
+def deezer_fallback(
+    spotify_id: str, artist: str, title: str, folder: pathlib.Path
+) -> bool:
+    """Search Deezer API and download 128kbps MP3 via streamrip (playlist variant).
+
+    See sync_liked.deezer_fallback for full documentation.
+    """
+    import urllib.request
+    import urllib.parse
+
+    if not DEEZER_ARL_FILE.exists():
+        return False
+
+    query = f"{artist} {title}".strip()
+    if not query:
+        return False
+
+    api_url = f"https://api.deezer.com/search?q={urllib.parse.quote(query)}"
+    try:
+        with urllib.request.urlopen(api_url, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as exc:
+        print(f"    Deezer API error: {exc}", flush=True)
+        return False
+
+    tracks = data.get("data", [])
+    if not tracks:
+        return False
+
+    track = tracks[0]
+    deezer_url: str = track["link"]
+    deezer_title: str = track["title"]
+    deezer_artist: str = track["artist"]["name"]
+    print(
+        f"    Deezer: found '{deezer_artist} - {deezer_title}' ({deezer_url})",
+        flush=True,
+    )
+
+    arl = DEEZER_ARL_FILE.read_text().strip()
+    config_path = pathlib.Path("/root/.config/streamrip/config.toml")
+    subprocess.run(
+        ["rip", "config", "reset"],
+        input=b"y\n",
+        capture_output=True,
+        timeout=10,
+    )
+    if config_path.exists():
+        text = config_path.read_text()
+        text = text.replace('arl = ""', f'arl = "{arl}"')
+        text = text.replace(
+            'folder = "/root/StreamripDownloads"', 'folder = "."'
+        )
+        lines = text.split("\n")
+        in_deezer = False
+        for i, line in enumerate(lines):
+            if line == "[deezer]":
+                in_deezer = True
+            elif in_deezer and line.startswith("["):
+                break
+            elif in_deezer and "quality" in line and not line.strip().startswith("#"):
+                lines[i] = line.replace("quality = 2", "quality = 0")
+                break
+        config_path.write_text("\n".join(lines))
+
+    rc = subprocess.run(
+        ["rip", "url", deezer_url],
+        cwd=str(folder),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    ).returncode
+    if rc != 0:
+        print(f"    Deezer download FAILED (rc={rc})", flush=True)
+        return False
+
+    mp3s = sorted(
+        (p for p in folder.glob("*.mp3")),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if mp3s:
+        try:
+            tags = mutagen.File(mp3s[0])
+            if tags:
+                tags["WOAS"] = WOAS(
+                    encoding=3, url=f"https://open.spotify.com/track/{spotify_id}"
+                )
+                tags.save()
+        except Exception:
+            pass
+
+    return True
 
 
 def retry_missing_downloads(
@@ -729,6 +824,25 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
     still_missing = retry_missing_downloads(
         folder, missing_tracked_ids, output_template
     )
+    if still_missing:
+        # Deezer fallback — last resort for tracks absent from YouTube entirely.
+        id_to_meta = {
+            s["song_id"]: (s.get("artist", ""), s.get("name", ""))
+            for s in songs
+            if "song_id" in s
+        }
+        for sid in sorted(still_missing):
+            artist, name = id_to_meta.get(sid, ("", ""))
+            print(
+                f"  Deezer fallback: trying '{artist} - {name}' ({sid})",
+                flush=True,
+            )
+            if deezer_fallback(sid, artist, name, folder):
+                print(f"  ✅ Deezer fallback SUCCESS: {sid}", flush=True)
+                still_missing.discard(sid)
+            else:
+                print(f"  ❌ Deezer fallback FAILED: {sid}", flush=True)
+
     if still_missing:
         print(
             f"WARNING: {len(still_missing)} tracked playlist files still missing after repair",

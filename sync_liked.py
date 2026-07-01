@@ -32,6 +32,7 @@ BATCH_FILE = MUSIC_DIR / "liked_batch.spotdl"
 FALLBACK_MAP_FILE = MUSIC_DIR / "youtube_fallback_cache.json"
 MISSING_IDS_FILE = MUSIC_DIR / "missing_ids.json"
 COLLISION_AUDIT_FILE = MUSIC_DIR / ".collision_audit.jsonl"
+DEEZER_ARL_FILE = MUSIC_DIR / ".deezer_arl"
 OUTPUT_TEMPLATE = "{artists}/{album}/{title}"
 BATCH_SIZE = 50
 
@@ -383,6 +384,106 @@ def load_fallback_map() -> dict[str, str]:
     return result
 
 
+def deezer_fallback(spotify_id: str, artist: str, title: str) -> bool:
+    """Search Deezer API and download 128kbps MP3 via streamrip.
+
+    Called as a last-resort fallback when both spotDL (YT Music) and
+    yt-dlp (YouTube web) have failed.  Returns True if a usable mp3
+    landed on disk, False otherwise.
+    """
+    import urllib.request
+    import urllib.parse
+
+    if not DEEZER_ARL_FILE.exists():
+        return False
+
+    query = f"{artist} {title}".strip()
+    if not query:
+        return False
+
+    # 1. Search Deezer public API (free, no auth required)
+    api_url = f"https://api.deezer.com/search?q={urllib.parse.quote(query)}"
+    try:
+        with urllib.request.urlopen(api_url, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as exc:
+        print(f"    Deezer API error: {exc}", flush=True)
+        return False
+
+    tracks = data.get("data", [])
+    if not tracks:
+        print(f"    Deezer: no results for '{query}'", flush=True)
+        return False
+
+    track = tracks[0]
+    deezer_url: str = track["link"]
+    deezer_title: str = track["title"]
+    deezer_artist: str = track["artist"]["name"]
+    print(
+        f"    Deezer: found '{deezer_artist} - {deezer_title}' ({deezer_url})",
+        flush=True,
+    )
+
+    # 2. Bootstrap streamrip config: generate defaults, inject ARL + settings
+    arl = DEEZER_ARL_FILE.read_text().strip()
+    config_path = pathlib.Path("/root/.config/streamrip/config.toml")
+    subprocess.run(
+        ["rip", "config", "reset"],
+        input=b"y\n",
+        capture_output=True,
+        timeout=10,
+    )
+    if config_path.exists():
+        text = config_path.read_text()
+        text = text.replace('arl = ""', f'arl = "{arl}"')
+        text = text.replace(
+            'folder = "/root/StreamripDownloads"', 'folder = "."'
+        )
+        # Set deezer quality to 0 (128 kbps MP3, free-tier); skip comment lines
+        lines = text.split("\n")
+        in_deezer = False
+        for i, line in enumerate(lines):
+            if line == "[deezer]":
+                in_deezer = True
+            elif in_deezer and line.startswith("["):
+                break
+            elif in_deezer and "quality" in line and not line.strip().startswith("#"):
+                lines[i] = line.replace("quality = 2", "quality = 0")
+                break
+        config_path.write_text("\n".join(lines))
+
+    # 3. Download via streamrip (128 kbps MP3, free-tier quality)
+    rc = subprocess.run(
+        ["rip", "url", deezer_url],
+        cwd=str(MUSIC_DIR),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    ).returncode
+    if rc != 0:
+        print(f"    Deezer download FAILED (rc={rc})", flush=True)
+        return False
+
+    # 4. Write Spotify ID as WOAS tag so scan_local_spotify_ids() finds it
+    mp3s = sorted(
+        (p for p in MUSIC_DIR.glob("*.mp3")),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if mp3s:
+        try:
+            tags = mutagen.File(mp3s[0])
+            if tags:
+                tags["WOAS"] = mutagen.id3.WOAS(
+                    encoding=3, url=f"https://open.spotify.com/track/{spotify_id}"
+                )
+                tags.save()
+        except Exception:
+            pass  # file is still playable without the tag
+
+    return True
+
+
 def load_downloads_map() -> dict[str, dict]:
     """Build song_id → song-record map from downloads.spotdl."""
     if not DOWNLOADS_FILE.exists():
@@ -628,6 +729,28 @@ def main() -> None:
             for sid in sorted(retry_candidates)
         ]
         spotdl("download", *urls, "--output", OUTPUT_TEMPLATE)
+
+        # Deezer fallback — last resort when both YT Music and YouTube web fail.
+        # Some tracks (e.g. Calluna by Quiescente) simply don't exist on YouTube
+        # but are available on Deezer at 128 kbps.
+        after_retry = scan_local_spotify_ids()
+        still_missing = retry_candidates - after_retry
+        if still_missing:
+            id_to_meta = {
+                s["song_id"]: (s.get("artist", ""), s.get("name", ""))
+                for s in songs
+                if "song_id" in s
+            }
+            for sid in sorted(still_missing):
+                artist, name = id_to_meta.get(sid, ("", ""))
+                print(
+                    f"  Deezer fallback: trying '{artist} - {name}' ({sid})",
+                    flush=True,
+                )
+                if deezer_fallback(sid, artist, name):
+                    print(f"  ✅ Deezer fallback SUCCESS: {sid}", flush=True)
+                else:
+                    print(f"  ❌ Deezer fallback FAILED: {sid}", flush=True)
 
     # Write missing_ids.json snapshot (still-missing after all paths)
     local_ids_final = scan_local_spotify_ids()

@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl unzip && apt-get clean
-RUN pip install --no-cache-dir spotdl
+RUN pip install --no-cache-dir spotdl streamrip
 COPY patch_spotipyfree.py /tmp/patch.py
 RUN python3 /tmp/patch.py
 
