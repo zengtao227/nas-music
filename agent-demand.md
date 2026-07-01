@@ -1,4 +1,4 @@
-# Agent Demand Gate: Jellyfin Playlist Auto-Rebuild
+# Agent Demand Gate: Jellyfin Playlist Auto-Rebuild & Auto-Create
 
 ## 1. Friction Point
 - Current user friction: Finamp's playlist count can silently drift from downloaded playlist files because Jellyfin playlist XML is not rebuilt automatically.
@@ -20,7 +20,8 @@
 - Smallest useful prototype: Mount Jellyfin playlist XML into the playlist sync container and rewrite the XML from actual MP3 files at the end of each run.
 
 ## 4. Success Preview And Risk Plan
-- Success standard: NAS cron updates both downloaded files and Jellyfin playlist XML without manual rebuilds.
-- Pause / kill signal: XML rebuild corrupts playlist files, drops valid entries, or blocks normal downloads.
-- Degraded fallback: Restore the timestamped Jellyfin playlist XML backup and run the previous sync script without the Jellyfin mount.
+- Success standard: NAS cron updates both downloaded files and Jellyfin playlist XML without manual rebuilds. Adding a new PLAYLISTS entry without a jellyfin_id automatically creates the playlist in Jellyfin and populates its XML on the second run.
+- Pause / kill signal: XML rebuild corrupts playlist files, drops valid entries, blocks normal downloads, or creates duplicate Jellyfin playlists.
+- Degraded fallback: Restore the timestamped Jellyfin playlist XML backup and run the previous sync script without the Jellyfin mount. Delete any duplicate Jellyfin playlists via Web UI.
+- No-duplicate guarantee: transient API lookup failure returns None → no creation; only a confirmed empty result triggers POST /Playlists.
 - Owner and review cadence: zengtao227 reviews sync logs and playlist counts after the initial deployment, then relies on cron logs for ongoing monitoring.

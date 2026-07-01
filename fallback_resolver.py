@@ -36,6 +36,7 @@ DURATION_TOLERANCE = 0.15  # ±15% duration tolerance
 MIN_SCORE_THRESHOLD = 0.4  # candidates below this score are rejected
 CACHE_TTL_DAYS = 90  # entries older than this are re-resolved
 NOISE_KEYWORDS = [  # penalise these unless in the Spotify title
+    # English
     "cover",
     "karaoke",
     "remix",
@@ -43,6 +44,20 @@ NOISE_KEYWORDS = [  # penalise these unless in the Spotify title
     "slowed",
     "reverb",
     "8d",
+    # Chinese (Simplified & Traditional)
+    "翻唱",  # cover
+    "伴奏",  # instrumental/karaoke
+    "现场",  # live
+    "混音",  # remix
+    "纯音乐",  # instrumental
+    # Japanese
+    "カバー",  # cover (katakana)
+    "ライブ",  # live (katakana)
+    "リミックス",  # remix (katakana)
+    # Korean
+    "커버",  # cover
+    "라이브",  # live
+    "리믹스",  # remix
 ]
 NOISE_PENALTY = 0.35  # score deducted per noise keyword matched
 
@@ -53,6 +68,9 @@ def _token_overlap(title1: str, title2: str) -> float:
     NFKD-normalizes, lowercases, strips punctuation, and filters
     single-character tokens and common stopwords before comparing.
     Returns 0.0 when either title produces an empty token set.
+    
+    For CJK text (Chinese/Japanese/Korean without whitespace), falls back
+    to character-level bigrams when whitespace splitting yields ≤1 token.
     """
     STOPWORDS = {
         "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
@@ -64,7 +82,20 @@ def _token_overlap(title1: str, title2: str) -> float:
         s = unicodedata.normalize("NFKD", s)
         s = s.lower()
         s = re.sub(r"[^\w\s]", "", s)
-        return {t for t in s.split() if len(t) > 1 and t not in STOPWORDS}
+        tokens = {t for t in s.split() if len(t) > 1 and t not in STOPWORDS}
+        
+        # Fallback for CJK: if whitespace splitting yields ≤1 token,
+        # use character bigrams for partial matching capability
+        if len(tokens) <= 1 and len(s) > 2:
+            # Remove whitespace for bigram extraction
+            s_no_space = s.replace(" ", "")
+            if len(s_no_space) >= 2:
+                # Generate overlapping character bigrams
+                bigrams = {s_no_space[i:i+2] for i in range(len(s_no_space) - 1)}
+                if bigrams:
+                    return bigrams
+        
+        return tokens
 
     a = _tokenize(title1)
     b = _tokenize(title2)
@@ -209,7 +240,8 @@ def score_candidate(
     if overlap > 0:
         score += 0.2 * overlap
 
-    return max(0.0, score)
+    # Clamp to documented [0.0, 1.0] range
+    return max(0.0, min(1.0, score))
 
 
 def resolve_url(spotify_id: str, liked_songs: list) -> tuple[str | None, float, dict]:
