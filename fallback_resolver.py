@@ -15,8 +15,10 @@ Usage:
 
 import json
 import pathlib
+import re
 import subprocess
 import sys
+import unicodedata
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
@@ -43,6 +45,32 @@ NOISE_KEYWORDS = [  # penalise these unless in the Spotify title
     "8d",
 ]
 NOISE_PENALTY = 0.35  # score deducted per noise keyword matched
+
+
+def _token_overlap(title1: str, title2: str) -> float:
+    """Jaccard similarity between normalized title token sets.
+
+    NFKD-normalizes, lowercases, strips punctuation, and filters
+    single-character tokens and common stopwords before comparing.
+    Returns 0.0 when either title produces an empty token set.
+    """
+    STOPWORDS = {
+        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+        "has", "he", "in", "is", "it", "its", "of", "on", "or", "that",
+        "the", "to", "was", "were", "will", "with",
+    }
+
+    def _tokenize(s: str) -> set[str]:
+        s = unicodedata.normalize("NFKD", s)
+        s = s.lower()
+        s = re.sub(r"[^\w\s]", "", s)
+        return {t for t in s.split() if len(t) > 1 and t not in STOPWORDS}
+
+    a = _tokenize(title1)
+    b = _tokenize(title2)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +204,11 @@ def score_candidate(
         if kw in yt_title_lower and kw not in spotify_title_lower:
             score -= NOISE_PENALTY
 
+    # Title-overlap bonus: reward identity signal without replacing duration
+    overlap = _token_overlap(spotify_title, candidate["title"])
+    if overlap > 0:
+        score += 0.2 * overlap
+
     return max(0.0, score)
 
 
@@ -298,6 +331,18 @@ def main() -> None:
         youtube_url, best_score, best_cand = resolve_url(sid, liked_songs)
 
         if youtube_url:
+            # Cache pollution guard: refuse to persist matches with zero
+            # title-word overlap between Spotify metadata and YouTube result.
+            spotify_name = metadata.get("name", "") if metadata else ""
+            yt_name = best_cand.get("title", "")
+            if _token_overlap(spotify_name, yt_name) == 0:
+                print(
+                    "  ⚠️  Skipping cache: zero title overlap (likely wrong match)",
+                    flush=True,
+                )
+                failed_count += 1
+                continue
+
             if not dry_run:
                 # Store confidence + duration_delta for future auditability.
                 # Low-confidence entries (score < 0.7) are probabilistic guesses.
