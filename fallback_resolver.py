@@ -15,11 +15,8 @@ Usage:
 
 import json
 import pathlib
-import re
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
@@ -46,18 +43,6 @@ NOISE_KEYWORDS = [  # penalise these unless in the Spotify title
     "8d",
 ]
 NOISE_PENALTY = 0.35  # score deducted per noise keyword matched
-
-# ---------------------------------------------------------------------------
-# InnerTube / YouTube Music constants (mirrored from SimpMusic WEB_REMIX client)
-# ---------------------------------------------------------------------------
-_YTM_SEARCH_URL = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false"
-_YTM_CLIENT_VERSION = "1.20260304.03.00"
-_YTM_FILTER_SONG = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D"
-_YTM_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
-)
-_DUR_RE = re.compile(r"^\d+:\d{2}(?::\d{2})?$")
 
 
 # ---------------------------------------------------------------------------
@@ -109,127 +94,9 @@ def is_cache_valid(entry: dict | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# YouTube Music InnerTube search (primary)
+# YouTube search + scoring
 # ---------------------------------------------------------------------------
-def _duration_to_seconds(text: str) -> float:
-    parts = [int(p) for p in text.split(":")]
-    seconds = 0
-    for p in parts:
-        seconds = seconds * 60 + p
-    return float(seconds)
-
-
-def _iter_song_renderers(node: object):
-    """Depth-first walk collecting every musicResponsiveListItemRenderer."""
-    if isinstance(node, dict):
-        renderer = node.get("musicResponsiveListItemRenderer")
-        if renderer:
-            yield renderer
-        for value in node.values():
-            yield from _iter_song_renderers(value)
-    elif isinstance(node, list):
-        for value in node:
-            yield from _iter_song_renderers(value)
-
-
-def _extract_video_id(renderer: dict) -> str | None:
-    vid = renderer.get("playlistItemData", {}).get("videoId")
-    if vid:
-        return vid
-    try:
-        return renderer["overlay"]["musicItemThumbnailOverlayRenderer"]["content"][
-            "musicPlayButtonRenderer"
-        ]["playNavigationEndpoint"]["watchEndpoint"]["videoId"]
-    except (KeyError, TypeError):
-        return None
-
-
-def _parse_renderer(renderer: dict) -> dict | None:
-    cols = renderer.get("flexColumns", [])
-    if not cols:
-        return None
-    try:
-        title = cols[0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][0][
-            "text"
-        ]
-    except (KeyError, IndexError, TypeError):
-        return None
-
-    video_id = _extract_video_id(renderer)
-    if not video_id:
-        return None
-
-    duration = 0.0
-    for col in cols[1:]:
-        runs = (
-            col.get("musicResponsiveListItemFlexColumnRenderer", {})
-            .get("text", {})
-            .get("runs")
-            or []
-        )
-        for run in runs:
-            text = run.get("text", "").strip()
-            if _DUR_RE.match(text):
-                duration = _duration_to_seconds(text)
-
-    return {
-        "title": title,
-        "url": f"https://www.youtube.com/watch?v={video_id}",
-        "duration": duration,
-    }
-
-
-def search_ytmusic_candidates(query: str, limit: int = 5) -> list[dict]:
-    """Search YouTube Music via InnerTube (Song filter, no auth required)."""
-    body = {
-        "context": {
-            "client": {
-                "clientName": "WEB_REMIX",
-                "clientVersion": _YTM_CLIENT_VERSION,
-                "hl": "en",
-                "gl": "US",
-                "userAgent": _YTM_USER_AGENT,
-            }
-        },
-        "query": query,
-        "params": _YTM_FILTER_SONG,
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Format-Version": "1",
-        "X-YouTube-Client-Name": "1",
-        "X-YouTube-Client-Version": _YTM_CLIENT_VERSION,
-        "x-origin": "https://music.youtube.com",
-        "Referer": "https://music.youtube.com/",
-        "User-Agent": _YTM_USER_AGENT,
-    }
-    req = urllib.request.Request(
-        _YTM_SEARCH_URL,
-        data=json.dumps(body).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
-        print(f"  ⚠️  YTMusic search failed for '{query}': {exc}", flush=True)
-        return []
-
-    candidates: list[dict] = []
-    for renderer in _iter_song_renderers(data.get("contents", {})):
-        parsed = _parse_renderer(renderer)
-        if parsed:
-            candidates.append(parsed)
-        if len(candidates) >= limit:
-            break
-    return candidates
-
-
-# ---------------------------------------------------------------------------
-# yt-dlp search (slow-path fallback for tracks absent from YT Music catalog)
-# ---------------------------------------------------------------------------
-def search_youtube_candidates_ytdlp(query: str) -> list[dict]:
+def search_youtube_candidates(query: str) -> list[dict]:
     """Search YouTube using yt-dlp, returning top 3 candidates."""
     cmd = [
         "yt-dlp",
@@ -271,23 +138,6 @@ def search_youtube_candidates_ytdlp(query: str) -> list[dict]:
     except Exception as exc:
         print(f"  ⚠️  yt-dlp search failed for '{query}': {exc}", flush=True)
         return []
-
-
-def gather_candidates(query: str, score_fn) -> list[dict]:
-    """Primary: YTMusic InnerTube. Slow-path: yt-dlp, only when YTMusic best score < threshold.
-
-    YT Music's Song filter fuzzy-matches almost any string to a non-empty list,
-    so 'empty result' is NOT a usable fallback trigger. For the ~6% of tracks
-    that are obscure/regional and absent from YT Music's curated catalog, YTMusic
-    returns unrelated songs that all fail the duration gate. Fall back on *best
-    score*, not emptiness, so yt-dlp only runs for genuinely hard cases.
-    """
-    ytm = search_ytmusic_candidates(query)
-    best = max((score_fn(c) for c in ytm), default=0.0)
-    if best >= MIN_SCORE_THRESHOLD:
-        return ytm
-    print("  ↓ YTMusic best score below threshold, adding yt-dlp candidates", flush=True)
-    return ytm + search_youtube_candidates_ytdlp(query)
 
 
 def score_candidate(
@@ -350,9 +200,7 @@ def resolve_url(spotify_id: str, liked_songs: list) -> tuple[str | None, float, 
         f"  → Searching: '{query}' (target: {spotify_duration:.0f}s)",
         flush=True,
     )
-    candidates = gather_candidates(
-        query, lambda c: score_candidate(c, title, spotify_duration)
-    )
+    candidates = search_youtube_candidates(query)
 
     scored = sorted(
         [(score_candidate(c, title, spotify_duration), c) for c in candidates],
