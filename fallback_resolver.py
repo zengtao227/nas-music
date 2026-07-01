@@ -34,7 +34,8 @@ MISSING_IDS_FILE = MUSIC_DIR / "missing_ids.json"
 # Tunable constants
 # ---------------------------------------------------------------------------
 DURATION_TOLERANCE = 0.15  # ±15% duration tolerance
-MIN_SCORE_THRESHOLD = 0.4  # candidates below this score are rejected
+MIN_SCORE_THRESHOLD = 0.4  # final rejection gate: candidates below this are never cached
+YTDLP_TRIGGER_THRESHOLD = 0.70  # if YTMusic best < this, also run yt-dlp and score the union
 CACHE_TTL_DAYS = 90  # entries older than this are re-resolved
 NOISE_KEYWORDS = [  # penalise these unless in the Spotify title
     "cover",
@@ -51,6 +52,8 @@ NOISE_PENALTY = 0.35  # score deducted per noise keyword matched
 # InnerTube / YouTube Music constants (mirrored from SimpMusic WEB_REMIX client)
 # ---------------------------------------------------------------------------
 _YTM_SEARCH_URL = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false"
+# MAINTENANCE: bump this when searches return 403 or empty results.
+# Current value mirrors SimpMusic core/models/YouTubeClient.kt (WEB_REMIX.clientVersion).
 _YTM_CLIENT_VERSION = "1.20260304.03.00"
 _YTM_FILTER_SONG = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D"
 _YTM_USER_AGENT = (
@@ -284,7 +287,7 @@ def gather_candidates(query: str, score_fn) -> list[dict]:
     """
     ytm = search_ytmusic_candidates(query)
     best = max((score_fn(c) for c in ytm), default=0.0)
-    if best >= MIN_SCORE_THRESHOLD:
+    if best >= YTDLP_TRIGGER_THRESHOLD:
         return ytm
     print("  ↓ YTMusic best score below threshold, adding yt-dlp candidates", flush=True)
     return ytm + search_youtube_candidates_ytdlp(query)
