@@ -21,6 +21,7 @@ from collections import defaultdict
 from typing import Any
 
 import mutagen
+import mutagen.id3
 import spotapi
 
 MUSIC_DIR = pathlib.Path("/music")
@@ -243,7 +244,7 @@ def _log_collision_decision(
     group: str, owner_id: str, competing_ids: list[str], reason: str
 ) -> None:
     record = {
-        "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "group": group,
         "owner_id": owner_id,
         "competing_ids": competing_ids,
@@ -466,7 +467,7 @@ def deezer_fallback(spotify_id: str, artist: str, title: str) -> bool:
 
     # 4. Write Spotify ID as WOAS tag so scan_local_spotify_ids() finds it
     mp3s = sorted(
-        (p for p in MUSIC_DIR.glob("*.mp3")),
+        (p for p in MUSIC_DIR.rglob("*.mp3")),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )

@@ -401,7 +401,7 @@ def deezer_fallback(
         return False
 
     mp3s = sorted(
-        (p for p in folder.glob("*.mp3")),
+        (p for p in folder.rglob("*.mp3")),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
