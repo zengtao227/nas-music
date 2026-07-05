@@ -21,19 +21,16 @@ from collections import defaultdict
 from typing import Any
 
 import mutagen
-import mutagen.id3
 import spotapi
+from shared import deezer_fallback, load_fallback_map, make_login, song_id_from_file
 
 MUSIC_DIR = pathlib.Path("/music")
 PLAYLISTS_DIR = MUSIC_DIR / "Playlists"
-SP_DC_FILE = MUSIC_DIR / ".spotify_sp_dc"
 SAVE_FILE = MUSIC_DIR / "liked.spotdl"
 DOWNLOADS_FILE = MUSIC_DIR / "downloads.spotdl"
 BATCH_FILE = MUSIC_DIR / "liked_batch.spotdl"
-FALLBACK_MAP_FILE = MUSIC_DIR / "youtube_fallback_cache.json"
 MISSING_IDS_FILE = MUSIC_DIR / "missing_ids.json"
 COLLISION_AUDIT_FILE = MUSIC_DIR / ".collision_audit.jsonl"
-DEEZER_ARL_FILE = MUSIC_DIR / ".deezer_arl"
 OUTPUT_TEMPLATE = "{artists}/{album}/{title}"
 BATCH_SIZE = 50
 
@@ -56,17 +53,6 @@ def spotdl_save_with_retry(*args: str, retries: int = 2, backoff: int = 30) -> i
             )
             time.sleep(backoff)
     return rc
-
-
-def song_id_from_file(mp3: pathlib.Path) -> str:
-    try:
-        tags = mutagen.File(mp3)
-        woas = tags.get("WOAS") if tags else None
-    except Exception:
-        return ""
-    if not woas:
-        return ""
-    return str(woas).rstrip("/").split("/")[-1]
 
 
 def build_entry_from_disk(mp3: pathlib.Path, song_id: str) -> dict:
@@ -291,10 +277,7 @@ def get_liked_ids() -> tuple[set[str], bool]:
     Returns (ids, total_count_absent) where total_count_absent=True means Spotify
     did not include totalCount in the response (caller should apply heuristic guard).
     """
-    sp_dc = SP_DC_FILE.read_text().strip()
-    cfg = spotapi.Config(logger=spotapi.NoopLogger())
-    dump = {"identifier": "mia", "password": "", "cookies": {"sp_dc": sp_dc}}
-    login = spotapi.Login.from_cookies(dump, cfg)
+    login = make_login()
     ids: set[str] = set()
     declared_total: int | None = None
     for chunk in spotapi.PrivatePlaylist(login).paginate_saved_tracks():
@@ -334,155 +317,6 @@ def load_save_file() -> tuple[list, set[str]]:
         return [], set()
     songs: list = data if isinstance(data, list) else data.get("songs", [])
     return songs, {s["song_id"] for s in songs if "song_id" in s}
-
-
-def load_fallback_map() -> dict[str, str]:
-    """Returns spotify_id → youtube_url, filtered by source trust rules.
-
-    Trust rules (all five must be considered before accepting an entry):
-    1. verified=false          → reject always, regardless of source
-    2. source=manual           → accept if verified absent or true
-    3. source=auto, new format → accept if confidence >= 0.35 AND resolved_at < 90 days
-    4. source=auto, old format → accept if verified=true (legacy allowlist)
-    5. source=auto, old format, no verified=true → reject
-    """
-    if not FALLBACK_MAP_FILE.exists():
-        return {}
-    try:
-        data = json.loads(FALLBACK_MAP_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-    now = datetime.datetime.now(datetime.timezone.utc)
-    result: dict[str, str] = {}
-    for sid, entry in data.items():
-        if not isinstance(entry, dict) or not entry.get("youtube_url"):
-            continue
-        if entry.get("verified") is False:  # rule 1: explicit false always rejects
-            continue
-        source = entry.get("source", "manual")
-        if source == "manual":
-            result[sid] = entry["youtube_url"]  # rule 2
-            continue
-        # auto source
-        has_new_fields = "confidence" in entry and bool(entry.get("resolved_at"))
-        if has_new_fields:
-            # rule 3: new resolver format — apply confidence + TTL
-            if float(entry.get("confidence") or 0) < 0.35:
-                continue
-            try:
-                ts = datetime.datetime.fromisoformat(
-                    entry["resolved_at"].replace("Z", "+00:00")
-                )
-                if (now - ts).days >= 90:
-                    continue
-            except ValueError:
-                continue
-            result[sid] = entry["youtube_url"]
-        elif entry.get("verified") is True:
-            result[sid] = entry["youtube_url"]  # rule 4: old auto + verified=true
-        # rule 5: old auto, no confidence/resolved_at, no verified=true → skip
-    return result
-
-
-def deezer_fallback(spotify_id: str, artist: str, title: str) -> bool:
-    """Search Deezer API and download 128kbps MP3 via streamrip.
-
-    Called as a last-resort fallback when both spotDL (YT Music) and
-    yt-dlp (YouTube web) have failed.  Returns True if a usable mp3
-    landed on disk, False otherwise.
-    """
-    import urllib.request
-    import urllib.parse
-
-    if not DEEZER_ARL_FILE.exists():
-        return False
-
-    query = f"{artist} {title}".strip()
-    if not query:
-        return False
-
-    # 1. Search Deezer public API (free, no auth required)
-    api_url = f"https://api.deezer.com/search?q={urllib.parse.quote(query)}"
-    try:
-        with urllib.request.urlopen(api_url, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception as exc:
-        print(f"    Deezer API error: {exc}", flush=True)
-        return False
-
-    tracks = data.get("data", [])
-    if not tracks:
-        print(f"    Deezer: no results for '{query}'", flush=True)
-        return False
-
-    track = tracks[0]
-    deezer_url: str = track["link"]
-    deezer_title: str = track["title"]
-    deezer_artist: str = track["artist"]["name"]
-    print(
-        f"    Deezer: found '{deezer_artist} - {deezer_title}' ({deezer_url})",
-        flush=True,
-    )
-
-    # 2. Bootstrap streamrip config: generate defaults, inject ARL + settings
-    arl = DEEZER_ARL_FILE.read_text().strip()
-    config_path = pathlib.Path("/root/.config/streamrip/config.toml")
-    subprocess.run(
-        ["rip", "config", "reset"],
-        input=b"y\n",
-        capture_output=True,
-        timeout=10,
-    )
-    if config_path.exists():
-        text = config_path.read_text()
-        text = text.replace('arl = ""', f'arl = "{arl}"')
-        text = text.replace(
-            'folder = "/root/StreamripDownloads"', 'folder = "."'
-        )
-        # Set deezer quality to 0 (128 kbps MP3, free-tier); skip comment lines
-        lines = text.split("\n")
-        in_deezer = False
-        for i, line in enumerate(lines):
-            if line == "[deezer]":
-                in_deezer = True
-            elif in_deezer and line.startswith("["):
-                break
-            elif in_deezer and "quality" in line and not line.strip().startswith("#"):
-                lines[i] = line.replace("quality = 2", "quality = 0")
-                break
-        config_path.write_text("\n".join(lines))
-
-    # 3. Download via streamrip (128 kbps MP3, free-tier quality)
-    rc = subprocess.run(
-        ["rip", "url", deezer_url],
-        cwd=str(MUSIC_DIR),
-        capture_output=True,
-        text=True,
-        timeout=120,
-    ).returncode
-    if rc != 0:
-        print(f"    Deezer download FAILED (rc={rc})", flush=True)
-        return False
-
-    # 4. Write Spotify ID as WOAS tag so scan_local_spotify_ids() finds it
-    mp3s = sorted(
-        (p for p in MUSIC_DIR.rglob("*.mp3")),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if mp3s:
-        try:
-            tags = mutagen.File(mp3s[0])
-            if tags:
-                tags["WOAS"] = mutagen.id3.WOAS(
-                    encoding=3, url=f"https://open.spotify.com/track/{spotify_id}"
-                )
-                tags.save()
-        except Exception:
-            pass  # file is still playable without the tag
-
-    return True
 
 
 def load_downloads_map() -> dict[str, dict]:
@@ -748,7 +582,7 @@ def main() -> None:
                     f"  Deezer fallback: trying '{artist} - {name}' ({sid})",
                     flush=True,
                 )
-                if deezer_fallback(sid, artist, name):
+                if deezer_fallback(sid, artist, name, MUSIC_DIR):
                     print(f"  ✅ Deezer fallback SUCCESS: {sid}", flush=True)
                 else:
                     print(f"  ❌ Deezer fallback FAILED: {sid}", flush=True)

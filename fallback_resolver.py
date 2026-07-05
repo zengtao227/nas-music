@@ -61,6 +61,12 @@ NOISE_KEYWORDS = [  # penalise these unless in the Spotify title
 ]
 NOISE_PENALTY = 0.35  # score deducted per noise keyword matched
 
+_STOPWORDS: frozenset[str] = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+    "has", "he", "in", "is", "it", "its", "of", "on", "or", "that",
+    "the", "to", "was", "were", "will", "with",
+})
+
 
 def _token_overlap(title1: str, title2: str) -> float:
     """Jaccard similarity between normalized title token sets.
@@ -68,21 +74,16 @@ def _token_overlap(title1: str, title2: str) -> float:
     NFKD-normalizes, lowercases, strips punctuation, and filters
     single-character tokens and common stopwords before comparing.
     Returns 0.0 when either title produces an empty token set.
-    
+
     For CJK text (Chinese/Japanese/Korean without whitespace), falls back
     to character-level bigrams when whitespace splitting yields ≤1 token.
     """
-    STOPWORDS = {
-        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
-        "has", "he", "in", "is", "it", "its", "of", "on", "or", "that",
-        "the", "to", "was", "were", "will", "with",
-    }
 
     def _tokenize(s: str) -> set[str]:
         s = unicodedata.normalize("NFKD", s)
         s = s.lower()
         s = re.sub(r"[^\w\s]", "", s)
-        tokens = {t for t in s.split() if len(t) > 1 and t not in STOPWORDS}
+        tokens = {t for t in s.split() if len(t) > 1 and t not in _STOPWORDS}
         
         # Fallback for CJK: if whitespace splitting yields ≤1 token,
         # use character bigrams for partial matching capability
@@ -244,12 +245,12 @@ def score_candidate(
     return max(0.0, min(1.0, score))
 
 
-def resolve_url(spotify_id: str, liked_songs: list) -> tuple[str | None, float, dict]:
+def resolve_url(spotify_id: str, id_to_meta: dict[str, dict]) -> tuple[str | None, float, dict]:
     """
     Pure function: Spotify ID → (youtube_url | None, best_score, best_candidate).
     No side effects beyond returning values.
     """
-    metadata = next((s for s in liked_songs if s.get("song_id") == spotify_id), None)
+    metadata = id_to_meta.get(spotify_id)
     if not metadata:
         return None, 0.0, {}
 
@@ -345,8 +346,10 @@ def main() -> None:
     skipped_count = 0
     failed_count = 0
 
+    id_to_meta = {s["song_id"]: s for s in liked_songs if "song_id" in s}
+
     for idx, sid in enumerate(missing_ids, 1):
-        metadata = next((s for s in liked_songs if s.get("song_id") == sid), None)
+        metadata = id_to_meta.get(sid)
         label = (
             f"{metadata.get('artist', '')} - {metadata.get('name', '')}"
             if metadata
@@ -360,7 +363,7 @@ def main() -> None:
             skipped_count += 1
             continue
 
-        youtube_url, best_score, best_cand = resolve_url(sid, liked_songs)
+        youtube_url, best_score, best_cand = resolve_url(sid, id_to_meta)
 
         if youtube_url:
             # Cache pollution guard: refuse to persist matches with zero
@@ -378,16 +381,7 @@ def main() -> None:
             if not dry_run:
                 # Store confidence + duration_delta for future auditability.
                 # Low-confidence entries (score < 0.7) are probabilistic guesses.
-                spotify_dur = float(
-                    next(
-                        (
-                            s.get("duration", 0)
-                            for s in liked_songs
-                            if s.get("song_id") == sid
-                        ),
-                        0,
-                    )
-                )
+                spotify_dur = float(metadata.get("duration", 0) if metadata else 0)
                 duration_delta = abs(best_cand.get("duration", 0) - spotify_dur)
                 cache[sid] = {
                     "youtube_url": youtube_url,

@@ -15,18 +15,15 @@ import pathlib
 import sys
 
 import spotapi
+from shared import make_login
 
 MUSIC_DIR = pathlib.Path("/music")
-SP_DC_FILE = MUSIC_DIR / ".spotify_sp_dc"
 SAVE_FILE = MUSIC_DIR / "liked.spotdl"
 BATCH_SIZE = 50  # larger than download batches — no rate-limit concern for save
 
 
 def get_liked_ids() -> list[str]:
-    sp_dc = SP_DC_FILE.read_text().strip()
-    cfg = spotapi.Config(logger=spotapi.NoopLogger())
-    dump = {"identifier": "mia", "password": "", "cookies": {"sp_dc": sp_dc}}
-    login = spotapi.Login.from_cookies(dump, cfg)
+    login = make_login()
     ids: list[str] = []
     for chunk in spotapi.PrivatePlaylist(login).paginate_saved_tracks():
         for item in chunk.get("items", []):
