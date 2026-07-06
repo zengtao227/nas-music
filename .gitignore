@@ -8,3 +8,5 @@ youtube_fallback_cache.json
 __pycache__/
 *.pyc
 *.pyo
+.telegram_config
+superpowers.db

@@ -34,8 +34,10 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 ├── downloads.spotdl                       ← spotdl 全局下载记录（自动维护）
 ├── sync_liked.py / sync_liked.sh          ← Liked Songs 同步脚本
 ├── sync_playlists.py / sync_playlists.sh  ← 私有歌单同步脚本
-├── check_cookie.sh                        ← cookie 有效性检测脚本
+├── check_cookie.sh                        ← cookie 有效性检测脚本（在 git 仓库中）
+├── .telegram_config                       ← Telegram Bot Token/Chat ID（600 权限，不进 git）
 ├── fallback_resolver.py                   ← Fallback 纯解析脚本（yt-dlp 搜索，不下载）
+├── run_fallback_resolver.sh               ← 每日 03:00 cron 自动解析缺失歌曲
 ├── youtube_fallback_cache.json            ← Spotify ID → YouTube URL 解析缓存
 └── Playlists/
     ├── summer26/
@@ -146,6 +148,7 @@ scp -O sync_playlists.py nas:/volume1/homes/Mia/Music/sync_playlists.py
 */5  *  *  *  *  root  bash /volume1/homes/Mia/Music/sync_liked.sh
 */5  *  *  *  *  root  bash /volume1/homes/Mia/Music/sync_playlists.sh
 0    8  *  *  *  root  bash /volume1/homes/Mia/Music/check_cookie.sh
+0    3  *  *  *  root  bash /volume1/homes/Mia/Music/run_fallback_resolver.sh
 ```
 
 ## Jellyfin
@@ -275,8 +278,8 @@ sudo /usr/local/bin/docker run --rm \
 - Cookie 有效：静默通过
 - Cookie 失效：通过 **@VPN_frank_bot**（Telegram）发送告警消息
 
-Bot 的 Token 和 Chat ID 存储在 `check_cookie.sh` 中，不在此处记录。
-需要修改通知目标时，直接编辑 `/volume1/homes/Mia/Music/check_cookie.sh`。
+Bot 的 Token 和 Chat ID 存储在 `/volume1/homes/Mia/Music/.telegram_config`（600 权限，
+不进 git）。`check_cookie.sh` 本体已纳入 git 仓库，修改通知目标时编辑 `.telegram_config` 即可。
 
 ---
 
@@ -339,6 +342,9 @@ spotdl download "YouTubeURL|SpotifyURL" --output "{artists}/{album}/{title}"
 - `resolved_at`: resolver 写入时间；90 天后 resolver 会重新搜索
 
 ### 运行方式
+
+每日 03:00 由 cron 通过 `run_fallback_resolver.sh` 自动运行（日志：`.fallback_resolver.log`），
+缺失歌曲无需人工介入即可收敛。需要立即处理时也可手动执行：
 
 ```bash
 # 在 NAS 上手动执行（Docker 容器内）

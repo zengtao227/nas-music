@@ -162,8 +162,11 @@ def cleanup_stale_conflicts(
     songs: list[dict],
     liked_ids_all: set[str],
     id_to_canonical_owner: dict[str, str],
-) -> None:
+) -> int:
     """Remove stale-WOAS placeholder files that would cause spotdl to skip a download.
+
+    Returns the number of files removed, so the caller knows whether the disk
+    changed after its last scan_local_spotify_ids() snapshot.
 
     WHY: spotdl's skip-existing check is filename-based, not Spotify-ID-based.
     When a track's Spotify ID changes (re-release / label re-upload), the old
@@ -180,6 +183,7 @@ def cleanup_stale_conflicts(
     """
     id_to_meta: dict[str, dict] = {s["song_id"]: s for s in songs if "song_id" in s}
 
+    removed = 0
     for sid in missing_ids:
         meta = id_to_meta.get(sid)
         if not meta:
@@ -222,8 +226,10 @@ def cleanup_stale_conflicts(
                 flush=True,
             )
             expected.unlink()
+            removed += 1
         except Exception:
             continue
+    return removed
 
 
 def _log_collision_decision(
@@ -495,6 +501,11 @@ def main() -> None:
                     )
 
     # --- remove unliked songs ---
+    # WHY the threshold differs from sync_playlists (max(30, 30% of size)): the
+    # liked library is hundreds of songs, so 30 already covers any plausible manual
+    # un-like batch, while a percentage limit would let a broken snapshot delete
+    # dozens of files. Small playlists get wholesale restructures, so they need the
+    # adaptive form; liked deletions are also backstopped by the totalCount guard.
     if removed_ids:
         if len(removed_ids) > MAX_DELETIONS:
             print(
@@ -527,7 +538,9 @@ def main() -> None:
     # WHY: remove stale-WOAS placeholders that cause spotdl to skip downloads.
     # With deterministic ownership, non-owner siblings are also removed to let
     # the canonical owner's file land at the shared path.
-    cleanup_stale_conflicts(missing_ids, songs, liked_ids_all, id_to_canonical_owner)
+    stale_removed = cleanup_stale_conflicts(
+        missing_ids, songs, liked_ids_all, id_to_canonical_owner
+    )
 
     fallback_map = load_fallback_map()
     # Non-owners are never downloaded — canonical owner represents the entire group.
@@ -588,7 +601,10 @@ def main() -> None:
                     print(f"  ❌ Deezer fallback FAILED: {sid}", flush=True)
 
     # Write missing_ids.json snapshot (still-missing after all paths)
-    local_ids_final = scan_local_spotify_ids()
+    # Rescan only if something after the post-sync scan could have touched the
+    # disk; in the common no-op run the first scan is still accurate.
+    disk_dirty = stale_removed > 0 or bool(resolved) or bool(retry_candidates)
+    local_ids_final = scan_local_spotify_ids() if disk_dirty else local_ids_after_sync
     truly_missing = liked_ids_all - local_ids_final
     collision_satisfied = resolve_path_collisions(truly_missing, songs)
     still_missing = list(truly_missing - collision_satisfied)
