@@ -34,7 +34,7 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 ├── downloads.spotdl                       ← spotdl 全局下载记录（自动维护）
 ├── sync_liked.py / sync_liked.sh          ← Liked Songs 同步脚本
 ├── sync_playlists.py / sync_playlists.sh  ← 私有歌单同步脚本
-├── check_cookie.sh                        ← cookie 有效性检测脚本（在 git 仓库中）
+├── check_cookie.sh                        ← 同步健康检测脚本，基于日志判定（在 git 仓库中）
 ├── .telegram_config                       ← Telegram Bot Token/Chat ID（600 权限，不进 git）
 ├── fallback_resolver.py                   ← Fallback 纯解析脚本（yt-dlp 搜索，不下载）
 ├── run_fallback_resolver.sh               ← 每日 03:00 cron 自动解析缺失歌曲
@@ -200,7 +200,7 @@ curl -X POST 'http://localhost:8096/Library/VirtualFolders/Name?name=旧名&newN
 | spotDL 镜像 | `spotdl-local:latest` | 自建镜像，修复了 SpotipyFree ownerV2/name/uri bug |
 | cloudflared | `/volume1/docker/cloudflared/` | Cloudflare Tunnel，外网访问 |
 | 音乐文件 | `/volume1/homes/Mia/Music/` | 见「文件结构」 |
-| Cookie 检测 | `/volume1/homes/Mia/Music/check_cookie.sh` | 每日 08:00 检测，失效时发 Telegram 通知 |
+| 同步健康检测 | `/volume1/homes/Mia/Music/check_cookie.sh` | 每日 08:00 读同步日志判定健康，异常时发 Telegram 通知 |
 
 ## spotDL Docker 镜像（spotdl-local:latest）
 
@@ -273,10 +273,19 @@ sudo /usr/local/bin/docker run --rm \
 
 ### 每日有效性检测与通知
 
-每日 08:00 cron 自动运行 `check_cookie.sh`：
-- 读取 `.spotify_sp_dc`，向 Spotify 发一次测试请求
-- Cookie 有效：静默通过
-- Cookie 失效：通过 **@VPN_frank_bot**（Telegram）发送告警消息
+每日 08:00 cron 自动运行 `check_cookie.sh`。检测**不再向 Spotify 发请求**——
+Spotify 于 2025-03 给 `open.spotify.com/get_access_token` 加了 TOTP 校验，有效
+cookie 也会被 403，直接探测只会产生误报（2026-07-07 已实证：告警 403 的同时
+同步正常拉到 821 首）。现在改为读 `.spotdl_liked_sync.log` 判定：
+
+- 最近 30 分钟内有 `Liked sync done` 且最近 3 次运行中至少一次出现
+  `Spotify liked: N`（该行仅在 cookie 认证 + 完整性校验通过后打印）→ 静默
+- 最近 3 次全部 `LoginError` → cookie 真失效，告警提示更换 sp_dc
+- 完成记录过期 / 日志缺失 / 无数据无 LoginError → 按各自原因告警
+- 单次瞬时失败（如 Spotify 503）不告警
+
+告警仍通过 **@VPN_frank_bot**（Telegram）发送。测试可用环境变量：
+`MUSIC_DIR`（改日志目录）、`MAX_AGE_MINUTES`、`DRY_RUN=1`（打印代替发送）。
 
 Bot 的 Token 和 Chat ID 存储在 `/volume1/homes/Mia/Music/.telegram_config`（600 权限，
 不进 git）。`check_cookie.sh` 本体已纳入 git 仓库，修改通知目标时编辑 `.telegram_config` 即可。
