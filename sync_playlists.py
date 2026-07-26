@@ -53,6 +53,12 @@ PLAYLISTS = [
         "jellyfin_name": "Can Dances",
         "jellyfin_id": "313dc8185ed60db38a6a6b42e2321835",
     },
+    {
+        "id": "4rYsc7tTRe7UCGY8ajz8k1",
+        "name": "calm",
+        "folder": "calm",
+        "jellyfin_name": "Calm",
+    },
 ]
 
 
