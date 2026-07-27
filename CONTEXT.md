@@ -198,8 +198,13 @@ cat /tmp/query_lib.py | ssh nas "cat > /tmp/query_lib.py && sudo /usr/local/bin/
 2. `py_compile` + `ruff check`（不要顺手修复无关的历史 lint 提示）。
 3. `git commit` + `git push`。
 4. 部署：`scp -O` 在部分环境（如这台 VPS → NAS 的路由）会报 `subsystem request failed` 失败，改用 `cat file | ssh nas "cat > /volume1/homes/Mia/Music/sync_playlists.py"`。
-5. 手动跑两次同步脚本（`ssh nas "sudo bash /volume1/homes/Mia/Music/sync_playlists.sh"`，中间留一点时间间隔），强制走完两阶段的 Jellyfin 播放列表创建流程，不用等 cron 跑两轮（约 10 分钟）。
-6. 验证：`/volume1/homes/Mia/Music/Playlists/<folder>/` 下出现下载的文件，`/volume1/docker/jellyfin/config/data/playlists/` 下出现对应的新文件夹。
+5. 手动跑同步脚本（`ssh nas "sudo bash /volume1/homes/Mia/Music/sync_playlists.sh"`），不用等 cron（每 5 分钟一轮）。**判断"够了"的标准不是固定跑几次，而是看日志里出现这一行：**
+   ```
+   Jellyfin playlist '<Jellyfin 名称>': N items written (0 tracked files missing, ...)
+   ```
+   在这行出现之前都不算完成，出现之后（且 `tracked files missing` 为 0）才算真正同步完。第 1 次通常只会创建 Jellyfin 播放列表（日志显示 `... created (...) — XML will be populated on next run`，不写 XML），之后每次重跑都会尝试补齐还没下载成功的曲目，直到全部到位、上面那行 N 等于歌单总曲目数为止——**实测中 2026-07-27 添加 Katseye Animal 时跑了 3 次才完全到位**（第 1 次下载了 18/21 首，第 2 次因 Spotify 端 503 中途崩溃，第 3 次才补完剩下 3 首并写入 XML），不要假设固定 2 次就一定够，也可能因为 Spotify 端瞬时报错（`Could not get session` / `503` 等）需要多跑几次，不代表 cookie 失效或需要人工介入。
+   - **flock 陷阱**：这个脚本用 `flock -n` 防并发，如果手动执行时刚好撞上 cron 的 5 分钟节点，会静默 `exit 0`，日志里**完全不会出现新的 `Playlist sync started` 行**。每次手动跑完都先确认日志末尾多了一条新的 `started`/`done`，如果没有，说明这次调用被跳过了，直接重新跑一次，而不是误以为"已经跑过一次了"。
+6. 验证：`/volume1/homes/Mia/Music/Playlists/<folder>/` 下出现下载的文件（数量应等于歌单总曲目数），`/volume1/docker/jellyfin/config/data/playlists/` 下出现对应的新文件夹且 `playlist.xml` 里有曲目条目（不是空的 `<Item>` 骨架）。
 
 ---
 
