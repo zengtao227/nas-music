@@ -124,6 +124,10 @@ python3 -m py_compile sync_playlists.py && ruff check sync_playlists.py
 git add sync_playlists.py
 git commit -m "feat: add Winter 26 playlist"
 git push
+
+# 从 Mac 直接执行 scp -O 通常没问题；但从 Frankfurt VPS 执行 scp -O 会报
+# "subsystem request failed"（2026-07-27 确认），这种情况改用 cat 管道：
+#   cat sync_playlists.py | ssh nas "cat > /volume1/homes/Mia/Music/sync_playlists.py"
 scp -O sync_playlists.py nas:/volume1/homes/Mia/Music/sync_playlists.py
 ```
 
