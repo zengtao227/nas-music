@@ -142,6 +142,63 @@ scp -O sync_playlists.py nas:/volume1/homes/Mia/Music/sync_playlists.py
 
 ---
 
+### 如何检查 Mia 的 Spotify 库找新歌单
+
+背景：2026-07-27 用户反馈之前没有一个明确的流程去检查 Mia 的 Spotify 库里有没有新歌单/未追踪的歌单，导致遗漏。这里记录一遍可重复执行的流程（区别于上面"如何添加新歌单"——那一节讲的是**已确认要加的歌单怎么落地**，这一节讲的是**怎么先找出候选**）。
+
+**第 1 步：一次性查询 Spotify 库（不是常驻容器）**
+
+`spotdl-local` 镜像不是长期运行的容器，不能 `docker exec` 进去，只能一次性 `docker run --rm` 跑完就退出。从这台 VPS（或任何能 ssh 到 `nas` 的机器）执行：
+
+```bash
+cat > /tmp/query_lib.py << 'EOF'
+import sys
+sys.path.insert(0, '/music')
+from shared import make_login
+import spotapi, json
+
+login = make_login()
+lib = spotapi.PrivatePlaylist(login).get_library()
+items = lib.get("data", {}).get("me", {}).get("libraryV3", {}).get("items", [])
+for it in items:
+    node = it.get("item", {})
+    data = node.get("data", {})
+    typename = data.get("__typename", "")
+    if typename == "Playlist":
+        name = data.get("name")
+        owner = (data.get("ownerV2", {}) or {}).get("data", {}).get("name", "")
+        uri = data.get("uri", "")
+        print(f"{typename}\t{owner}\t{name}\t{uri}")
+EOF
+cat /tmp/query_lib.py | ssh nas "cat > /tmp/query_lib.py && sudo /usr/local/bin/docker run --rm -v /volume1/homes/Mia/Music:/music -v /tmp/query_lib.py:/music/query_lib.py:ro --entrypoint python3 spotdl-local:latest /music/query_lib.py"
+```
+
+输出是 Mia 整个 Spotify 库里的每一个歌单（tab 分隔：类型 / owner / 名称 / Spotify URI），包括她收藏/关注但不是自己创建的歌单，不只是她自建的。
+
+**第 2 步：owner 字段不是能否同步的硬性过滤条件**
+
+`owner` 只是"这是不是她自己建的"的信号，不代表"能不能同步"。歌单可能属于厂牌/官方账号（例如 owner 显示 "Interscope Records" 而不是 "Mia Zeng"），只要它在她的库里、她确认想要，就该同步——2026-07-27 添加的 Katseye Animal 歌单就是这种情况（owner 是 Interscope Records，但她明确要求同步）。
+
+**第 3 步：和 `sync_playlists.py` 里已追踪的 `PLAYLISTS` 做 diff**
+
+把第 1 步输出的 URI/名称列表，和 `sync_playlists.py` 里 `PLAYLISTS` 列表现有的 `id`/`name` 对比，找出不在追踪列表里的候选歌单。
+
+**第 4 步：加入追踪前必须先找用户确认，不能自作主张**
+
+找到候选歌单后，**必须先跟用户确认**，不能因为它出现在库里就默认要同步。先例：2026-07-26 曾经找到好几个未追踪的歌单，最后只确认了 `Calm` 一个要加，其余的都明确按下不动，等待确认。
+
+**第 5 步：确认后按上面"如何添加新歌单"的流程落地**
+
+简述（详细步骤见上一节，这里不重复）：
+1. 在 `PLAYLISTS` 加一条（省略 `jellyfin_id`，脚本会自动创建 Jellyfin 播放列表）。
+2. `py_compile` + `ruff check`（不要顺手修复无关的历史 lint 提示）。
+3. `git commit` + `git push`。
+4. 部署：`scp -O` 在部分环境（如这台 VPS → NAS 的路由）会报 `subsystem request failed` 失败，改用 `cat file | ssh nas "cat > /volume1/homes/Mia/Music/sync_playlists.py"`。
+5. 手动跑两次同步脚本（`ssh nas "sudo bash /volume1/homes/Mia/Music/sync_playlists.sh"`，中间留一点时间间隔），强制走完两阶段的 Jellyfin 播放列表创建流程，不用等 cron 跑两轮（约 10 分钟）。
+6. 验证：`/volume1/homes/Mia/Music/Playlists/<folder>/` 下出现下载的文件，`/volume1/docker/jellyfin/config/data/playlists/` 下出现对应的新文件夹。
+
+---
+
 ### Crontab（`/etc/crontab`）
 
 ```

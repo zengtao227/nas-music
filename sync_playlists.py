@@ -59,6 +59,12 @@ PLAYLISTS = [
         "folder": "calm",
         "jellyfin_name": "Calm",
     },
+    {
+        "id": "3pVbUjpOlKzbTXX77UEvnv",
+        "name": "katseye_animal",
+        "folder": "katseye_animal",
+        "jellyfin_name": "Katseye Animal",
+    },
 ]
 
 
