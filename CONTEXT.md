@@ -17,7 +17,7 @@ Mia 的自托管音乐流媒体系统。替代 Spotify Premium，音乐文件存
 Spotify（Mia 的免费账号）
     ↓ Liked Songs + 私有歌单 通过 sp_dc cookie 授权
 sync_liked.py / sync_playlists.py（spotapi + spotDL）每 5 分钟自动同步
-    ↓
+    ↓ 新增或修复 MP3 后由 lyrics.py 向 LRCLIB 做严格匹配
 NAS /volume1/homes/Mia/Music/
     ↓ Jellyfin 媒体服务器（端口 8096）
 Finamp（Mia 的 Android 手机 + Samsung 平板）
@@ -34,6 +34,7 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 ├── downloads.spotdl                       ← spotdl 全局下载记录（自动维护）
 ├── sync_liked.py / sync_liked.sh          ← Liked Songs 同步脚本
 ├── sync_playlists.py / sync_playlists.sh  ← 私有歌单同步脚本
+├── lyrics.py                               ← 新增/修复 MP3 的增量歌词下载
 ├── check_cookie.sh                        ← 同步健康检测脚本，基于日志判定（在 git 仓库中）
 ├── .telegram_config                       ← Telegram Bot Token/Chat ID（600 权限，不进 git）
 ├── fallback_resolver.py                   ← Fallback 纯解析脚本（yt-dlp 搜索，不下载）
@@ -85,6 +86,22 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 | 日志 | `/volume1/homes/Mia/Music/.spotdl_playlists_sync.log` |
 
 **私有歌单认证方式**：`spotapi.PublicPlaylist(playlist_id, client=login.client)` — 将 sp_dc 认证后的 TLS client 注入 PublicPlaylist，使其可访问私有歌单。
+
+---
+
+### 自动歌词（Liked Songs + 私有歌单）
+
+`sync_liked.py` 和 `sync_playlists.py` 在每轮同步前后记录 MP3 的 inode、大小和修改时间，只把本轮新增或替换的文件交给 `lyrics.py`。因此 Mia Like 新歌或向已配置的 Spotify 歌单加歌后，最多 5 分钟内会同时下载 MP3，并在 LRCLIB 有严格匹配时生成同名歌词文件：
+
+- 有时间轴的歌词写为 `.lrc`，只有纯文本时写为 `.txt`
+- 查询必须匹配 title、artist、album、duration，远端时长与 MP3 相差超过 3 秒即拒绝
+- 已有 `.lrc`、`.elrc` 或 `.txt` 一律不覆盖；MP3 本体不修改
+- 单次请求超时 10 秒、最多重试 1 次；无匹配、限流或网络失败只写入 `Lyrics:` 计数，不影响歌曲同步结果
+- Liked Songs 扫描明确排除 `Playlists/`；每个私有歌单只处理自己的目录
+
+Jellyfin 的实时监控会自动发现 sidecar，Finamp Beta 在播放页显示同步歌词。官方 `LrcLib Lyrics` v3 插件仍已安装，但 Jellyfin 10.11.11 上的 provider 查询返回 0 candidates，因此新增歌曲使用仓库内的严格直连模块，而不是依赖插件 scheduled task。
+
+2026-08-08 的历史全库回填结果为 992/1172 首有歌词（935 个 `.lrc`、57 个 `.txt`）；自动流程只处理以后新增或修复的 MP3，不会每 5 分钟重复查询历史无匹配歌曲。部署前脚本备份位于 `/volume1/homes/Mia/Music/.backups/automatic-lyrics-20260808T135132Z/`。
 
 ---
 
@@ -290,6 +307,8 @@ sudo /usr/local/bin/docker build --no-cache -t spotdl-local:latest /volume1/dock
 
 ## Finamp 配置（Mia 手机 + 平板）
 
+- **手机端版本**：Finamp Beta（Mia 已于 2026-08-08 完成升级，用于显示 Jellyfin 同步歌词）
+- **平板端版本**：未确认是否已升级到 Beta
 - **Server URL（在家）**：`http://192.168.68.68:8096`
 - **Server URL（外网）**：`https://music.zengsg.dpdns.org`
 - **账号**：Mia（Jellyfin 账号，非 Spotify）

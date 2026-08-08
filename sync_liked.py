@@ -23,6 +23,7 @@ from typing import Any
 import mutagen
 import spotapi
 from shared import deezer_fallback, load_fallback_map, make_login, song_id_from_file
+from lyrics import process_changed, snapshot
 
 MUSIC_DIR = pathlib.Path("/music")
 PLAYLISTS_DIR = MUSIC_DIR / "Playlists"
@@ -236,7 +237,9 @@ def _log_collision_decision(
     group: str, owner_id: str, competing_ids: list[str], reason: str
 ) -> None:
     record = {
-        "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ts": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
         "group": group,
         "owner_id": owner_id,
         "competing_ids": competing_ids,
@@ -374,6 +377,14 @@ def delete_files_for_ids(removed_ids: set[str]) -> int:
 
 def main() -> None:
     print("=== Liked Songs Sync ===", flush=True)
+
+    try:
+        lyrics_before = snapshot(MUSIC_DIR, exclude_playlists=True)
+    except Exception as exc:
+        print(
+            f"WARNING: lyrics snapshot unavailable ({type(exc).__name__})", flush=True
+        )
+        lyrics_before = None
 
     try:
         current_ids, total_count_absent = get_liked_ids()
@@ -573,8 +584,7 @@ def main() -> None:
             flush=True,
         )
         urls = [
-            f"https://open.spotify.com/track/{sid}"
-            for sid in sorted(retry_candidates)
+            f"https://open.spotify.com/track/{sid}" for sid in sorted(retry_candidates)
         ]
         spotdl("download", *urls, "--output", OUTPUT_TEMPLATE)
 
@@ -582,14 +592,14 @@ def main() -> None:
         # Some tracks (e.g. Calluna by Quiescente) simply don't exist on YouTube
         # but are available on Deezer at 128 kbps.
         after_retry = scan_local_spotify_ids()
-        still_missing = retry_candidates - after_retry
-        if still_missing:
+        retry_still_missing = retry_candidates - after_retry
+        if retry_still_missing:
             id_to_meta = {
                 s["song_id"]: (s.get("artist", ""), s.get("name", ""))
                 for s in songs
                 if "song_id" in s
             }
-            for sid in sorted(still_missing):
+            for sid in sorted(retry_still_missing):
                 artist, name = id_to_meta.get(sid, ("", ""))
                 print(
                     f"  Deezer fallback: trying '{artist} - {name}' ({sid})",
@@ -617,9 +627,14 @@ def main() -> None:
     tmp.write_text(json.dumps(still_missing))
     tmp.replace(MISSING_IDS_FILE)
     print(
-        f"missing_ids.json: {len(still_missing)} unresolved songs written", flush=True
+        f"missing_ids.json: {len(still_missing)} unresolved songs written",
+        flush=True,
     )
 
+    try:
+        process_changed(lyrics_before, snapshot(MUSIC_DIR, exclude_playlists=True))
+    except Exception as exc:
+        print(f"WARNING: lyrics processing failed ({type(exc).__name__})", flush=True)
     print("Done.", flush=True)
 
 

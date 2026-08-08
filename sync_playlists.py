@@ -23,6 +23,7 @@ import mutagen
 from mutagen.id3 import WOAS
 import spotapi
 from shared import deezer_fallback, load_fallback_map, make_login, song_id_from_file
+from lyrics import process_changed, snapshot
 
 MUSIC_DIR = pathlib.Path("/music")
 JELLYFIN_PLAYLISTS_DIR = pathlib.Path("/jellyfin_playlists")
@@ -546,6 +547,13 @@ def rebuild_jellyfin_playlist(
 def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
     folder = MUSIC_DIR / OUTPUT_BASE / pl["folder"]
     folder.mkdir(parents=True, exist_ok=True)
+    try:
+        lyrics_before = snapshot(folder)
+    except Exception as exc:
+        print(
+            f"WARNING: lyrics snapshot unavailable ({type(exc).__name__})", flush=True
+        )
+        lyrics_before = None
     save_file = folder / f"{pl['folder']}.spotdl"
     batch_file = folder / f"{pl['folder']}.batch.spotdl"
     output_template = f"{OUTPUT_BASE}/{pl['folder']}/{{artists}}/{{album}}/{{title}}"
@@ -592,7 +600,15 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
                 flush=True,
             )
         if jid:
-            rebuild_jellyfin_playlist(pl, folder, songs, api_key, build_file_key_to_paths(folder))
+            rebuild_jellyfin_playlist(
+                pl, folder, songs, api_key, build_file_key_to_paths(folder)
+            )
+        try:
+            process_changed(lyrics_before, snapshot(folder))
+        except Exception as exc:
+            print(
+                f"WARNING: lyrics processing failed ({type(exc).__name__})", flush=True
+            )
         return
 
     # --- add new songs ---
@@ -644,7 +660,9 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
                         folder, failed_ids, songs, _cbk
                     )
                     if failed_ids:
-                        failed_ids = repair_stale_woas_matches(folder, failed_ids, songs, _cbk)
+                        failed_ids = repair_stale_woas_matches(
+                            folder, failed_ids, songs, _cbk
+                        )
                 if failed_ids:
                     failed_ids = retry_missing_downloads(
                         folder, failed_ids, output_template
@@ -722,7 +740,13 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
         )
 
     if jid:
-        rebuild_jellyfin_playlist(pl, folder, songs, api_key, build_file_key_to_paths(folder))
+        rebuild_jellyfin_playlist(
+            pl, folder, songs, api_key, build_file_key_to_paths(folder)
+        )
+    try:
+        process_changed(lyrics_before, snapshot(folder))
+    except Exception as exc:
+        print(f"WARNING: lyrics processing failed ({type(exc).__name__})", flush=True)
 
 
 def main() -> None:
