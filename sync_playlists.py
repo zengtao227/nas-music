@@ -15,6 +15,7 @@ Runs inside the spotdl-local Docker container with /music mounted.
 import json
 import pathlib
 import subprocess
+import time
 import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Any
@@ -22,7 +23,16 @@ from typing import Any
 import mutagen
 from mutagen.id3 import WOAS
 import spotapi
-from shared import deezer_fallback, load_fallback_map, make_login, song_id_from_file
+from shared import (
+    deezer_fallback,
+    load_fallback_map,
+    load_retry_state,
+    make_login,
+    record_retry_outcome,
+    retry_due,
+    save_retry_state,
+    song_id_from_file,
+)
 from lyrics import process_changed, snapshot
 
 MUSIC_DIR = pathlib.Path("/music")
@@ -31,6 +41,7 @@ JELLYFIN_MUSIC_PREFIX = "/media/music"
 JELLYFIN_URL = "http://192.168.68.68:8096"
 JELLYFIN_API_KEY_FILE = MUSIC_DIR / ".jellyfin_api_key"
 JELLYFIN_MIA_USER_ID = "9DBDBD21-920F-49E0-86B0-AC5D26D2C63B"
+RETRY_STATE_FILE = MUSIC_DIR / ".playlist_retry_state.json"
 OUTPUT_BASE = "Playlists"
 BATCH_SIZE = 20
 
@@ -612,6 +623,21 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
         return
 
     # --- add new songs ---
+    # WHY: failed new songs are rolled back out of the .spotdl and reappear as
+    # "added" next run, so they share the repair path's retry cooldown.
+    add_retry_state = load_retry_state(RETRY_STATE_FILE)
+    add_now = time.time()
+    add_cooling = {
+        sid
+        for sid in added_ids
+        if not retry_due(add_retry_state, f"{folder.name}:{sid}", add_now)
+    }
+    if add_cooling:
+        print(
+            f"Added: {len(add_cooling)} previously failed songs in retry cooldown, skipped",
+            flush=True,
+        )
+        added_ids = added_ids - add_cooling
     if added_ids:
         id_list = list(added_ids)
         total = (len(id_list) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -667,6 +693,13 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
                     failed_ids = retry_missing_downloads(
                         folder, failed_ids, output_template
                     )
+                record_retry_outcome(
+                    add_retry_state,
+                    {f"{folder.name}:{sid}" for sid in batch_ids_set},
+                    {f"{folder.name}:{sid}" for sid in failed_ids},
+                    add_now,
+                )
+                save_retry_state(RETRY_STATE_FILE, add_retry_state)
                 if failed_ids:
                     songs = [s for s in songs if s.get("song_id") not in failed_ids]
                     write_save_file(save_file, songs)
@@ -711,9 +744,20 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
     missing_tracked_ids = repair_stale_woas_matches(
         folder, missing_tracked_ids, songs, candidates_by_key
     )
-    still_missing = retry_missing_downloads(
-        folder, missing_tracked_ids, output_template
-    )
+    retry_state = load_retry_state(RETRY_STATE_FILE)
+    now = time.time()
+    due_ids = {
+        sid
+        for sid in missing_tracked_ids
+        if retry_due(retry_state, f"{folder.name}:{sid}", now)
+    }
+    cooling = len(missing_tracked_ids) - len(due_ids)
+    if cooling:
+        print(
+            f"Repair: {cooling} missing files in retry cooldown, skipped this run",
+            flush=True,
+        )
+    still_missing = retry_missing_downloads(folder, due_ids, output_template)
     if still_missing:
         # Deezer fallback — last resort for tracks absent from YouTube entirely.
         id_to_meta = {
@@ -732,6 +776,15 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
                 still_missing.discard(sid)
             else:
                 print(f"  ❌ Deezer fallback FAILED: {sid}", flush=True)
+
+    record_retry_outcome(
+        retry_state,
+        {f"{folder.name}:{sid}" for sid in due_ids},
+        {f"{folder.name}:{sid}" for sid in still_missing},
+        now,
+    )
+    save_retry_state(RETRY_STATE_FILE, retry_state)
+    still_missing |= missing_tracked_ids - due_ids
 
     if still_missing:
         print(

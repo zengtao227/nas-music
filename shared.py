@@ -9,6 +9,7 @@ import path resolves correctly when scripts run as:
 import datetime
 import json
 import pathlib
+import re
 import subprocess
 import urllib.parse
 import urllib.request
@@ -89,6 +90,77 @@ def load_fallback_map() -> dict[str, str]:
     return result
 
 
+def _normalize_match_text(value: str) -> str:
+    return "".join(ch for ch in value.casefold() if ch.isalnum())
+
+
+def _core_title(title: str) -> str:
+    """Drop bracketed and ' - ' suffixes such as '(Stacks from All Sides)' or '- Remix'."""
+    core = re.sub(r"[(\[（【].*?[)\]）】]", "", title)
+    core = core.split(" - ")[0]
+    return _normalize_match_text(core)
+
+
+def _loosely_equal(a: str, b: str) -> bool:
+    return bool(a) and bool(b) and (a in b or b in a)
+
+
+def deezer_result_matches(
+    want_artist: str, want_title: str, got_artist: str, got_title: str
+) -> bool:
+    """True when a Deezer search hit plausibly is the requested Spotify track."""
+    artist_ok = _loosely_equal(
+        _normalize_match_text(want_artist), _normalize_match_text(got_artist)
+    )
+    title_ok = _loosely_equal(_core_title(want_title), _core_title(got_title))
+    return artist_ok and title_ok
+
+
+# WHY: songs that fail every source (YouTube 403, absent on Deezer) used to be
+# retried on every 5-minute run forever; each attempt costs ~5 MB of overhead in
+# a fresh container, which added ~1 GB/h during the 2026-09-14 incident.
+RETRY_FREE_ATTEMPTS = 3
+RETRY_COOLDOWN_SECONDS = 24 * 3600
+
+
+def load_retry_state(path: pathlib.Path) -> dict[str, dict[str, float]]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_retry_state(path: pathlib.Path, state: dict[str, dict[str, float]]) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
+    tmp.replace(path)
+
+
+def retry_due(state: dict[str, dict[str, float]], key: str, now: float) -> bool:
+    entry = state.get(key)
+    if not entry:
+        return True
+    if entry.get("failures", 0) < RETRY_FREE_ATTEMPTS:
+        return True
+    return now - entry.get("last_attempt", 0) >= RETRY_COOLDOWN_SECONDS
+
+
+def record_retry_outcome(
+    state: dict[str, dict[str, float]],
+    attempted: set[str],
+    still_missing: set[str],
+    now: float,
+) -> None:
+    for key in attempted:
+        if key in still_missing:
+            entry = state.setdefault(key, {"failures": 0, "last_attempt": 0})
+            entry["failures"] = entry.get("failures", 0) + 1
+            entry["last_attempt"] = now
+        else:
+            state.pop(key, None)
+
+
 def deezer_fallback(
     spotify_id: str, artist: str, title: str, base_dir: pathlib.Path
 ) -> bool:
@@ -118,7 +190,27 @@ def deezer_fallback(
         print(f"    Deezer: no results for '{query}'", flush=True)
         return False
 
-    track = tracks[0]
+    # WHY: blindly taking tracks[0] once mapped two different Spotify IDs onto the
+    # same unrelated Deezer track; both wrote WOAS on one file and kept evicting
+    # each other, re-downloading every 5 minutes (2026-09-14 traffic incident).
+    track = next(
+        (
+            t
+            for t in tracks[:5]
+            if deezer_result_matches(
+                artist, title, t.get("artist", {}).get("name", ""), t.get("title", "")
+            )
+        ),
+        None,
+    )
+    if track is None:
+        first = tracks[0]
+        print(
+            f"    Deezer: rejected mismatched results for '{query}'"
+            f" (top: '{first.get('artist', {}).get('name', '')} - {first.get('title', '')}')",
+            flush=True,
+        )
+        return False
     deezer_url: str = track["link"]
     print(
         f"    Deezer: found '{track['artist']['name']} - {track['title']}' ({deezer_url})",

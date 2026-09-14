@@ -22,7 +22,16 @@ from typing import Any
 
 import mutagen
 import spotapi
-from shared import deezer_fallback, load_fallback_map, make_login, song_id_from_file
+from shared import (
+    deezer_fallback,
+    load_fallback_map,
+    load_retry_state,
+    make_login,
+    record_retry_outcome,
+    retry_due,
+    save_retry_state,
+    song_id_from_file,
+)
 from lyrics import process_changed, snapshot
 
 MUSIC_DIR = pathlib.Path("/music")
@@ -31,6 +40,7 @@ SAVE_FILE = MUSIC_DIR / "liked.spotdl"
 DOWNLOADS_FILE = MUSIC_DIR / "downloads.spotdl"
 BATCH_FILE = MUSIC_DIR / "liked_batch.spotdl"
 MISSING_IDS_FILE = MUSIC_DIR / "missing_ids.json"
+RETRY_STATE_FILE = MUSIC_DIR / ".liked_retry_state.json"
 COLLISION_AUDIT_FILE = MUSIC_DIR / ".collision_audit.jsonl"
 OUTPUT_TEMPLATE = "{artists}/{album}/{title}"
 BATCH_SIZE = 50
@@ -556,6 +566,17 @@ def main() -> None:
     fallback_map = load_fallback_map()
     # Non-owners are never downloaded — canonical owner represents the entire group.
     download_candidates = missing_ids - non_owner_ids
+    retry_state = load_retry_state(RETRY_STATE_FILE)
+    now = time.time()
+    cooling = {
+        sid for sid in download_candidates if not retry_due(retry_state, sid, now)
+    }
+    if cooling:
+        print(
+            f"Retry cooldown: {len(cooling)} missing songs skipped this run",
+            flush=True,
+        )
+    download_candidates -= cooling
     resolved = {
         sid: fallback_map[sid] for sid in download_candidates if sid in fallback_map
     }
@@ -616,6 +637,10 @@ def main() -> None:
     disk_dirty = stale_removed > 0 or bool(resolved) or bool(retry_candidates)
     local_ids_final = scan_local_spotify_ids() if disk_dirty else local_ids_after_sync
     truly_missing = liked_ids_all - local_ids_final
+    record_retry_outcome(
+        retry_state, download_candidates, download_candidates - local_ids_final, now
+    )
+    save_retry_state(RETRY_STATE_FILE, retry_state)
     collision_satisfied = resolve_path_collisions(truly_missing, songs)
     still_missing = list(truly_missing - collision_satisfied)
     if collision_satisfied:
