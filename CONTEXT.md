@@ -69,6 +69,7 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 | Shell 入口（带 lockfile） | `/volume1/homes/Mia/Music/sync_liked.sh` |
 | 追踪文件 | `/volume1/homes/Mia/Music/liked.spotdl` |
 | 日志 | `/volume1/homes/Mia/Music/.spotdl_liked_sync.log` |
+| 碰撞决策审计 | `/volume1/homes/Mia/Music/.collision_audit.jsonl`（每轮重复追加，与日志一样由 `sync_liked.sh` 超过 5MB 轮转为 `.bak`） |
 
 ### 私有歌单（每 5 分钟）
 
@@ -215,7 +216,7 @@ for it in items:
         uri = data.get("uri", "")
         print(f"{typename}\t{owner}\t{name}\t{uri}")
 EOF
-cat /tmp/query_lib.py | ssh nas "cat > /tmp/query_lib.py && sudo /usr/local/bin/docker run --rm -v /volume1/homes/Mia/Music:/music -v /tmp/query_lib.py:/music/query_lib.py:ro --entrypoint python3 spotdl-local:latest /music/query_lib.py"
+cat /tmp/query_lib.py | ssh nas "cat > /tmp/query_lib.py && sudo /usr/local/bin/docker run --rm -v /volume1/homes/Mia/Music:/music -v /tmp/query_lib.py:/query_lib.py:ro -e PYTHONPATH=/music --entrypoint python3 spotdl-local:latest /query_lib.py"
 ```
 
 输出是 Mia 整个 Spotify 库里的每一个歌单（tab 分隔：类型 / owner / 名称 / Spotify URI），包括她收藏/关注但不是自己创建的歌单，不只是她自建的。
@@ -430,7 +431,10 @@ spotdl download "YouTubeURL|SpotifyURL" --output "{artists}/{album}/{title}"
 - **重试上限**：同一首歌所有来源连续失败 3 次后，改为每 24 小时最多重试一次（状态文件
   `.playlist_retry_state.json`，key=`<歌单目录>:<spotify_id>`；`.liked_retry_state.json`，key=`<spotify_id>`）。
   下载成功即清除记录。背景：2026-09-14 前永久缺失的歌每 5 分钟重试，每次约 5MB 开销，NAS 流量约 1GB/h 触发 Deco 告警。
-- **人工通知**：达到上限时发一次 Telegram（与 check_cookie.sh 同一 bot，`.telegram_config`），列出「歌手 - 歌名 (ID)」。
+- **人工通知**：达到上限时发一次 Telegram（与 check_cookie.sh 同一 bot，`.telegram_config`），列出「歌手 - 歌名 [时长] (ID)」，
+  并附「🔎 诊断」：镜像内 yt-dlp 版本与发布天数、PyPI 最新版本，以及按规则判断的最可能原因——
+  yt-dlp 比 PyPI 旧或超过 60 天 → 重建镜像升级；yt-dlp 最新但一次多首失败 → 查同步日志；单首失败 → 手动找链接。
+  用户把这条通知原样贴给 Claude 即可按下面步骤处理。
   发送成功才写 `notified: true`，之后不再重复。
 - **收到通知后的人工处理**：用 `yt-dlp --flat-playlist --print "%(duration)s | %(uploader)s | %(title)s | %(url)s" "ytsearch8:<关键词>"`
   在 spotdl-local 容器里搜，按 Spotify 时长对齐挑候选，写入缓存（`source: "manual"`，resolver 不会覆盖），

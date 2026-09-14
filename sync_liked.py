@@ -32,6 +32,7 @@ from shared import (
     retry_due,
     save_retry_state,
     song_id_from_file,
+    song_label,
 )
 from lyrics import process_changed, snapshot
 
@@ -642,7 +643,7 @@ def main() -> None:
         retry_state, download_candidates, download_candidates - local_ids_final, now
     )
     liked_labels = {
-        s["song_id"]: f"{s.get('artist', '')} - {s.get('name', '')}"
+        s["song_id"]: song_label(s)
         for s in songs
         if s.get("song_id") in (download_candidates | cooling)
     }

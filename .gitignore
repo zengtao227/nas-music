@@ -9,7 +9,6 @@ __pycache__/
 *.pyc
 *.pyo
 .telegram_config
-superpowers.db
 .spotify_playlist_discovery.json
 .spotify_playlist_discovery.json.bak
 .playlist_retry_state.json

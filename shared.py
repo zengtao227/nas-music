@@ -185,11 +185,84 @@ def send_telegram(text: str) -> bool:
         return False
 
 
+def song_label(song: dict[str, Any]) -> str:
+    """'Artist - Title [m:ss]' — the length is what manual YouTube matching needs."""
+    label = f"{song.get('artist', '')} - {song.get('name', '')}"
+    duration = song.get("duration")
+    if isinstance(duration, (int, float)) and duration > 0:
+        label += f" [{int(duration) // 60}:{int(duration) % 60:02d}]"
+    return label
+
+
+# WHY: YouTube changes its player/signature scheme every few weeks; a stale
+# yt-dlp still reads metadata but every audio download gets HTTP 403, which is
+# what caused the 2026-09-14 incident. The alert names the likely cause so the
+# message alone is enough to start the fix.
+YTDLP_STALE_DAYS = 60
+RUNBOOK_HINT = "处理手册：nas-music CONTEXT.md「来源顺序、重试上限与人工通知」"
+
+
+def _version_date(version: str) -> datetime.date | None:
+    try:
+        year, month, day = (int(part) for part in version.split(".")[:3])
+        return datetime.date(year, month, day)
+    except (ValueError, TypeError):
+        return None
+
+
+def diagnose_download_failures(
+    count: int, installed: str, latest: str, today: datetime.date
+) -> list[str]:
+    installed_date = _version_date(installed)
+    latest_date = _version_date(latest)
+    status = f"yt-dlp {installed or '版本未知'}"
+    if installed_date:
+        status += f"（发布于 {(today - installed_date).days} 天前）"
+    status += f"，PyPI 最新 {latest}" if latest else "，PyPI 最新版本查询失败"
+
+    outdated = bool(installed_date and latest_date and latest_date > installed_date)
+    stale = bool(installed_date and (today - installed_date).days > YTDLP_STALE_DAYS)
+    if outdated or stale:
+        cause = (
+            "最可能原因：YouTube 改了播放器/签名算法，镜像里的 yt-dlp 已过旧"
+            "（日志表现为 YT-DLP download error / HTTP 403）。"
+            "处理：重建 spotdl-local 镜像升级 yt-dlp，再清空 retry state 让这些歌重试。"
+        )
+    elif count >= 3:
+        cause = (
+            "多首同时失败但 yt-dlp 已是最新：可能 YouTube 刚改版而 yt-dlp 还没跟上，"
+            "或网络/Deezer 登录异常。处理：先看 .spotdl_*_sync.log 里这些歌的具体报错。"
+        )
+    else:
+        cause = (
+            "最可能原因：YouTube/Deezer 上没有同名同歌手的版本"
+            "（TikTok remix、改名上传、翻唱等），自动匹配找不到。"
+            "处理：按歌名和时长手动搜 YouTube，把链接写入 youtube_fallback_cache.json（source=manual）。"
+        )
+    return [status, cause, RUNBOOK_HINT]
+
+
+def current_download_diagnosis(count: int) -> list[str]:
+    try:
+        from yt_dlp.version import __version__ as installed
+    except Exception:
+        installed = ""
+    try:
+        with urllib.request.urlopen(
+            "https://pypi.org/pypi/yt-dlp/json", timeout=10
+        ) as resp:
+            latest = str(json.loads(resp.read().decode())["info"]["version"])
+    except Exception:
+        latest = ""
+    return diagnose_download_failures(count, installed, latest, datetime.date.today())
+
+
 def notify_exhausted_retries(
     state: RetryState,
     labels: dict[str, str],
     where: str,
     send: Callable[[str], bool] = send_telegram,
+    diagnose: Callable[[int], list[str]] | None = None,
 ) -> None:
     """Tell a human once per song after every source failed RETRY_FREE_ATTEMPTS times.
 
@@ -206,10 +279,14 @@ def notify_exhausted_retries(
     if not pending:
         return
     lines = [f"• {labels[key]} ({key.rsplit(':', 1)[-1]})" for key in pending]
+    diagnosis = (diagnose or current_download_diagnosis)(len(pending))
     text = (
         f"🎵 NAS 音乐同步（{where}）：{len(pending)} 首歌所有来源都下载失败"
         "（YouTube Music/YouTube、缓存链接、Deezer），"
-        "已改为每 24 小时重试一次，需要人工处理：\n" + "\n".join(lines)
+        "已改为每 24 小时重试一次，需要人工处理：\n"
+        + "\n".join(lines)
+        + "\n\n🔎 诊断\n"
+        + "\n".join(diagnosis)
     )
     if send(text):
         for key in pending:

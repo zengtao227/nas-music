@@ -37,6 +37,7 @@ from shared import (
     retry_due,
     save_retry_state,
     song_id_from_file,
+    song_label,
 )
 from lyrics import process_changed, snapshot
 
@@ -779,7 +780,7 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
                 notify_exhausted_retries(
                     add_retry_state,
                     {
-                        f"{folder.name}:{s['song_id']}": f"{s.get('artist', '')} - {s.get('name', '')}"
+                        f"{folder.name}:{s['song_id']}": song_label(s)
                         for s in batch_new
                         if s.get("song_id") in failed_ids
                     },
@@ -869,11 +870,7 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
         {f"{folder.name}:{sid}" for sid in still_missing},
         now,
     )
-    id_to_label = {
-        s["song_id"]: f"{s.get('artist', '')} - {s.get('name', '')}"
-        for s in songs
-        if "song_id" in s
-    }
+    id_to_label = {s["song_id"]: song_label(s) for s in songs if "song_id" in s}
     notify_exhausted_retries(
         retry_state,
         {
