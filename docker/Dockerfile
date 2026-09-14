@@ -3,6 +3,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl unz
 RUN pip install --no-cache-dir spotdl streamrip
 COPY patch_spotipyfree.py /tmp/patch.py
 RUN python3 /tmp/patch.py
+COPY patch_format_logging.py /tmp/patch_format_logging.py
+RUN python3 /tmp/patch_format_logging.py
 
 # Deno runtime — required by yt-dlp/spotdl for YouTube JS challenges (nsig/poToken).
 # Without it, some YouTube videos fail with "Some YouTube downloads require Deno".
