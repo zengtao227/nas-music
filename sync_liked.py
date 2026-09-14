@@ -27,6 +27,7 @@ from shared import (
     load_fallback_map,
     load_retry_state,
     make_login,
+    notify_exhausted_retries,
     record_retry_outcome,
     retry_due,
     save_retry_state,
@@ -640,6 +641,12 @@ def main() -> None:
     record_retry_outcome(
         retry_state, download_candidates, download_candidates - local_ids_final, now
     )
+    liked_labels = {
+        s["song_id"]: f"{s.get('artist', '')} - {s.get('name', '')}"
+        for s in songs
+        if s.get("song_id") in (download_candidates | cooling)
+    }
+    notify_exhausted_retries(retry_state, liked_labels, "Liked Songs")
     save_retry_state(RETRY_STATE_FILE, retry_state)
     collision_satisfied = resolve_path_collisions(truly_missing, songs)
     still_missing = list(truly_missing - collision_satisfied)

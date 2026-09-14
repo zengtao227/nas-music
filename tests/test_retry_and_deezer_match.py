@@ -81,5 +81,42 @@ class RetryBackoffTest(unittest.TestCase):
             self.assertEqual(shared.load_retry_state(path), {})
 
 
+class ExhaustedNotifyTest(unittest.TestCase):
+    def _state(self):
+        return {
+            "pl:a": {"failures": shared.RETRY_FREE_ATTEMPTS, "last_attempt": 1.0},
+            "pl:b": {"failures": 1, "last_attempt": 1.0},
+            "other:c": {"failures": 9, "last_attempt": 1.0},
+        }
+
+    def test_notifies_only_exhausted_owned_keys_once(self):
+        state = self._state()
+        sent: list[str] = []
+        labels = {"pl:a": "Artist - A", "pl:b": "Artist - B"}
+        shared.notify_exhausted_retries(
+            state, labels, "歌单 X", send=lambda t: sent.append(t) or True
+        )
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Artist - A", sent[0])
+        self.assertNotIn("Artist - B", sent[0])
+        self.assertTrue(state["pl:a"]["notified"])
+        self.assertNotIn("notified", state["other:c"])
+        shared.notify_exhausted_retries(
+            state, labels, "歌单 X", send=lambda t: sent.append(t) or True
+        )
+        self.assertEqual(len(sent), 1)
+
+    def test_failed_send_keeps_alert_pending(self):
+        state = self._state()
+        shared.notify_exhausted_retries(state, {"pl:a": "A"}, "x", send=lambda t: False)
+        self.assertNotIn("notified", state["pl:a"])
+
+    def test_notified_flag_survives_later_failure(self):
+        state = {"pl:a": {"failures": 3, "last_attempt": 1.0, "notified": True}}
+        shared.record_retry_outcome(state, {"pl:a"}, {"pl:a"}, 2.0)
+        self.assertTrue(state["pl:a"]["notified"])
+        self.assertEqual(state["pl:a"]["failures"], 4)
+
+
 if __name__ == "__main__":
     unittest.main()

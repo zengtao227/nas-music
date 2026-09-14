@@ -1,6 +1,9 @@
 FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl unzip && apt-get clean
 RUN pip install --no-cache-dir spotdl streamrip
+# WHY: spotdl's resolved yt-dlp lagged ~3 months behind; stale extractors got
+# HTTP 403 from YouTube on every download (2026-09-14 traffic incident).
+RUN pip install --no-cache-dir --upgrade yt-dlp yt-dlp-ejs
 COPY patch_spotipyfree.py /tmp/patch.py
 RUN python3 /tmp/patch.py
 COPY patch_format_logging.py /tmp/patch_format_logging.py

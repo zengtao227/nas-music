@@ -28,6 +28,7 @@ from shared import (
     load_fallback_map,
     load_retry_state,
     make_login,
+    notify_exhausted_retries,
     record_retry_outcome,
     retry_due,
     save_retry_state,
@@ -699,6 +700,15 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
                     {f"{folder.name}:{sid}" for sid in failed_ids},
                     add_now,
                 )
+                notify_exhausted_retries(
+                    add_retry_state,
+                    {
+                        f"{folder.name}:{s['song_id']}": f"{s.get('artist', '')} - {s.get('name', '')}"
+                        for s in batch_new
+                        if s.get("song_id") in failed_ids
+                    },
+                    f"歌单 {pl.get('jellyfin_name', pl['name'])}",
+                )
                 save_retry_state(RETRY_STATE_FILE, add_retry_state)
                 if failed_ids:
                     songs = [s for s in songs if s.get("song_id") not in failed_ids]
@@ -782,6 +792,19 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
         {f"{folder.name}:{sid}" for sid in due_ids},
         {f"{folder.name}:{sid}" for sid in still_missing},
         now,
+    )
+    id_to_label = {
+        s["song_id"]: f"{s.get('artist', '')} - {s.get('name', '')}"
+        for s in songs
+        if "song_id" in s
+    }
+    notify_exhausted_retries(
+        retry_state,
+        {
+            f"{folder.name}:{sid}": id_to_label.get(sid, sid)
+            for sid in missing_tracked_ids
+        },
+        f"歌单 {pl.get('jellyfin_name', pl['name'])}",
     )
     save_retry_state(RETRY_STATE_FILE, retry_state)
     still_missing |= missing_tracked_ids - due_ids

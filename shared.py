@@ -13,6 +13,7 @@ import re
 import subprocess
 import urllib.parse
 import urllib.request
+from typing import Any, Callable
 
 import mutagen
 import mutagen.id3
@@ -22,6 +23,7 @@ MUSIC_DIR = pathlib.Path("/music")
 SP_DC_FILE = MUSIC_DIR / ".spotify_sp_dc"
 DEEZER_ARL_FILE = MUSIC_DIR / ".deezer_arl"
 FALLBACK_MAP_FILE = MUSIC_DIR / "youtube_fallback_cache.json"
+TELEGRAM_CONFIG_FILE = MUSIC_DIR / ".telegram_config"
 
 
 def make_login() -> spotapi.Login:
@@ -120,10 +122,11 @@ def deezer_result_matches(
 # retried on every 5-minute run forever; each attempt costs ~5 MB of overhead in
 # a fresh container, which added ~1 GB/h during the 2026-09-14 incident.
 RETRY_FREE_ATTEMPTS = 3
+RetryState = dict[str, dict[str, Any]]
 RETRY_COOLDOWN_SECONDS = 24 * 3600
 
 
-def load_retry_state(path: pathlib.Path) -> dict[str, dict[str, float]]:
+def load_retry_state(path: pathlib.Path) -> RetryState:
     try:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
@@ -131,13 +134,13 @@ def load_retry_state(path: pathlib.Path) -> dict[str, dict[str, float]]:
     return data if isinstance(data, dict) else {}
 
 
-def save_retry_state(path: pathlib.Path, state: dict[str, dict[str, float]]) -> None:
+def save_retry_state(path: pathlib.Path, state: RetryState) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
     tmp.replace(path)
 
 
-def retry_due(state: dict[str, dict[str, float]], key: str, now: float) -> bool:
+def retry_due(state: RetryState, key: str, now: float) -> bool:
     entry = state.get(key)
     if not entry:
         return True
@@ -147,7 +150,7 @@ def retry_due(state: dict[str, dict[str, float]], key: str, now: float) -> bool:
 
 
 def record_retry_outcome(
-    state: dict[str, dict[str, float]],
+    state: RetryState,
     attempted: set[str],
     still_missing: set[str],
     now: float,
@@ -159,6 +162,59 @@ def record_retry_outcome(
             entry["last_attempt"] = now
         else:
             state.pop(key, None)
+
+
+def send_telegram(text: str) -> bool:
+    """Send via the same bot as check_cookie.sh; never raises into the sync."""
+    try:
+        conf = dict(
+            line.split("=", 1)
+            for line in TELEGRAM_CONFIG_FILE.read_text().splitlines()
+            if "=" in line
+        )
+        token = conf["BOT_TOKEN"].strip().strip('"')
+        chat_id = conf["CHAT_ID"].strip().strip('"')
+        body = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=body
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return bool(json.loads(resp.read().decode()).get("ok"))
+    except Exception as exc:
+        print(f"WARNING: Telegram notify failed ({type(exc).__name__})", flush=True)
+        return False
+
+
+def notify_exhausted_retries(
+    state: RetryState,
+    labels: dict[str, str],
+    where: str,
+    send: Callable[[str], bool] = send_telegram,
+) -> None:
+    """Tell a human once per song after every source failed RETRY_FREE_ATTEMPTS times.
+
+    labels maps retry keys owned by this caller to "Artist - Title"; keys outside
+    it are left for their own sync to report. The flag is set only after a
+    successful send so a Telegram outage retries the alert next run.
+    """
+    pending = sorted(
+        key
+        for key in labels
+        if state.get(key, {}).get("failures", 0) >= RETRY_FREE_ATTEMPTS
+        and not state[key].get("notified")
+    )
+    if not pending:
+        return
+    lines = [f"• {labels[key]} ({key.rsplit(':', 1)[-1]})" for key in pending]
+    text = (
+        f"🎵 NAS 音乐同步（{where}）：{len(pending)} 首歌所有来源都下载失败"
+        "（YouTube Music/YouTube、缓存链接、Deezer），"
+        "已改为每 24 小时重试一次，需要人工处理：\n" + "\n".join(lines)
+    )
+    if send(text):
+        for key in pending:
+            state[key]["notified"] = True
+        print(f"Notified: {len(pending)} exhausted songs sent to Telegram", flush=True)
 
 
 def deezer_fallback(
