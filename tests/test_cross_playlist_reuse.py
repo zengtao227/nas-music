@@ -19,12 +19,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-if "spotapi" not in sys.modules:
+try:
+    import spotapi  # noqa: F401  (real package, when fully installed)
+except ModuleNotFoundError:
     sys.modules["spotapi"] = types.ModuleType("spotapi")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import sync_playlists as sp  # noqa: E402
+import sync_playlists as sp
 
 
 def _fake_song_id_from_file(mp3: Path) -> str:
@@ -129,13 +131,20 @@ class DeleteFilesForIdsTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             folder = Path(tmp)
             f = folder / "Artist" / "gone.mp3"
+            # A second, untouched file keeps the directory non-empty after the
+            # deletion below — isolates this test to delete_files_for_ids'
+            # id-matching behavior rather than its (separate, pre-existing)
+            # empty-parent rmdir cleanup.
+            other = folder / "Artist" / "stays.mp3"
             _touch(f, "GONE")
+            _touch(other, "UNRELATED")
 
             with patch.object(sp, "song_id_from_file", _fake_song_id_from_file):
                 deleted = sp.delete_files_for_ids(folder, removed_ids={"GONE"})
 
             self.assertEqual(deleted, 1)
             self.assertFalse(f.exists())
+            self.assertTrue(other.exists())
 
 
 class RebuildJellyfinPlaylistCrossReuseTest(unittest.TestCase):
