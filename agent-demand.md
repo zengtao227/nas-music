@@ -54,3 +54,36 @@
 - Pause / kill signal: Any lyric exception escapes into the main sync, download duration materially increases beyond the bounded per-track lookup budget, wrong-version lyrics are observed, or existing sidecars change.
 - Degraded fallback: Disable the lyric call sites while leaving music synchronization unchanged; keep the standalone strict batch downloader for manual backfills.
 - Owner and review cadence: zengtao227 checks the Liked Songs and playlist logs after deployment and reviews matched/missed/error counters after 7 days or 20 new MP3 files.
+
+---
+
+# Agent Demand Gate: Automatic Discovery Of Mia's New Spotify Playlists
+
+## 1. Friction Point
+- Current user friction: A playlist created by Mia is ignored until Tao manually queries her Spotify library, copies its ID into `PLAYLISTS`, deploys the edited script, and runs synchronization.
+- Who experiences it: Mia waits for the playlist to appear in Finamp; Tao performs the discovery and configuration steps.
+- Why fixed rules or normal automation are insufficient: They are sufficient if the trigger is a newly created Spotify playlist owned by Mia. The request does not need an AI agent.
+- Evidence source: `sync_playlists.py` currently iterates a hard-coded `PLAYLISTS` list, while `CONTEXT.md` documents a separate manual `get_library()` query and diff procedure.
+
+## 2. Quantified Gap
+- Baseline metric: New playlists have no automatic discovery path and can remain unsynchronized indefinitely until Tao intervenes.
+- Target metric: Every eligible new playlist is discovered in the existing 5-minute sync cycle and its available songs are downloaded, lyric-matched, and published to Jellyfin without a code edit.
+- Failure or exit point: A followed or shared playlist that Mia did not create is silently enrolled, two Spotify playlists collide on one local folder name, or a transient library response removes existing music.
+- Acceptable error / misclassification rate: 0 unintended playlist enrollments and 0 destructive removals caused by discovery failures.
+- Measurement window: Each 5-minute playlist sync cycle; review the first three automatically discovered playlists.
+
+## 3. Solution Choice
+- Recommended path: non-agent-automation
+- Why this path fits current data and change frequency: Spotify playlist IDs, ownership, names, and library membership can be compared deterministically against a persisted registry.
+- Why the rejected paths are weaker: Prompt chains, agents, and fine-tuning add nondeterminism to a fixed state-diff problem and cannot expose Spotify objects that its API does not return.
+- Smallest useful prototype: Discover playlists owned by Mia, normalize a collision-safe local folder name, persist the discovered playlist ID and display name outside the Python source, then pass the resulting entries into the existing `sync_playlist()` pipeline.
+
+## 4. Success Preview And Risk Plan
+- Success standard: A newly created eligible playlist appears in Finamp with all downloadable tracks and exact-match LRCLIB sidecars within normal sync latency, without editing or redeploying `sync_playlists.py`.
+- Pause / kill signal: An unowned/followed playlist is enrolled, a name collision targets an existing directory, Spotify returns an incomplete library snapshot, or automatic discovery changes/deletes an existing configured playlist.
+- Degraded fallback: Disable discovery and continue syncing the current static `PLAYLISTS` entries; retain the persisted registry for inspection and manual recovery.
+- Owner and review cadence: Tao reviews logs and the local/Jellyfin playlist count after each of the first three discoveries, then checks through the existing daily health workflow.
+
+## Confirmed Scope
+- “New Folder” means a normal Spotify playlist newly created by Mia, not a Spotify desktop Playlist Folder.
+- Existing untracked playlists must remain excluded. The first complete Spotify library snapshot is therefore a non-enrolling baseline; only later unseen IDs owned by Mia are eligible for automatic enrollment.

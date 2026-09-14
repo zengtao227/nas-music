@@ -10,3 +10,9 @@ __pycache__/
 *.pyo
 .telegram_config
 superpowers.db
+.spotify_playlist_discovery.json
+.spotify_playlist_discovery.json.bak
+.playlist_retry_state.json
+.liked_retry_state.json
+.DS_Store
+.workbuddy-ai/

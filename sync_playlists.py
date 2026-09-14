@@ -23,6 +23,10 @@ from typing import Any
 import mutagen
 from mutagen.id3 import WOAS
 import spotapi
+from playlist_discovery import (
+    DiscoveryOutcome,
+    update_discovery_state,
+)
 from shared import (
     deezer_fallback,
     load_fallback_map,
@@ -45,6 +49,9 @@ JELLYFIN_MIA_USER_ID = "9DBDBD21-920F-49E0-86B0-AC5D26D2C63B"
 RETRY_STATE_FILE = MUSIC_DIR / ".playlist_retry_state.json"
 OUTPUT_BASE = "Playlists"
 BATCH_SIZE = 20
+LIBRARY_QUERY_LIMIT = 500
+MIA_SPOTIFY_OWNER_URI = "spotify:user:31ilqs7huj7wvtguhxhnjmfmlmsi"
+PLAYLIST_DISCOVERY_STATE_FILE = MUSIC_DIR / ".spotify_playlist_discovery.json"
 
 # Refuse to delete more than this many files from one playlist in a single run.
 # A few removals are real; dozens signal an incomplete snapshot (expired cookie
@@ -79,6 +86,75 @@ PLAYLISTS = [
         "jellyfin_name": "Katseye Animal",
     },
 ]
+
+
+def discover_new_playlists(
+    login: spotapi.Login, configured_playlists: list[dict[str, Any]]
+) -> list[dict[str, str]]:
+    """Return persisted automatic playlists and enroll safe new candidates."""
+    try:
+        library: dict[str, Any] = dict(
+            spotapi.PrivatePlaylist(login).get_library(LIBRARY_QUERY_LIMIT)
+        )
+        outcome: DiscoveryOutcome = update_discovery_state(
+            PLAYLIST_DISCOVERY_STATE_FILE,
+            library,
+            MIA_SPOTIFY_OWNER_URI,
+            configured_playlists,
+        )
+    except Exception as exc:
+        print(
+            f"WARNING: playlist discovery skipped ({type(exc).__name__}: {exc})",
+            flush=True,
+        )
+        print(
+            "Playlist discovery: fail-closed; only fixed playlists will sync "
+            "and automatic playlist files will be preserved",
+            flush=True,
+        )
+        return []
+
+    if outcome.initialized:
+        print(
+            "Playlist discovery baseline initialized: "
+            f"{outcome.library_playlist_count} current playlists recorded; "
+            "0 existing playlists auto-enrolled",
+            flush=True,
+        )
+    else:
+        if outcome.recovered_from_backup:
+            print("Playlist discovery state recovered from backup", flush=True)
+        for playlist in outcome.discovered:
+            print(
+                "Playlist discovery: enrolled new Mia playlist "
+                f"'{playlist['jellyfin_name']}' ({playlist['id']})",
+                flush=True,
+            )
+        if outcome.ignored_new:
+            print(
+                f"Playlist discovery: recorded {outcome.ignored_new} new "
+                "unowned/already-configured playlists without enrolling them",
+                flush=True,
+            )
+        if outcome.deferred_unknown_owner:
+            print(
+                f"Playlist discovery: deferred {outcome.deferred_unknown_owner} "
+                "new playlists with unknown owner until a later cycle",
+                flush=True,
+            )
+        if outcome.inactive:
+            print(
+                f"Playlist discovery: {outcome.inactive} automatic playlists are "
+                "not currently in Mia's library; local files were preserved",
+                flush=True,
+            )
+        print(
+            f"Playlist discovery summary: {outcome.library_playlist_count} current, "
+            f"{len(outcome.playlists)} automatic active, "
+            f"{len(outcome.discovered)} enrolled this cycle",
+            flush=True,
+        )
+    return [dict(playlist) for playlist in outcome.playlists]
 
 
 def get_playlist_song_ids(login: spotapi.Login, playlist_id: str) -> set[str]:
@@ -831,9 +907,20 @@ def main() -> None:
     api_key = _load_jellyfin_api_key()
 
     login = make_login()
+    playlists: list[dict[str, Any]] = [dict(playlist) for playlist in PLAYLISTS]
+    playlists.extend(discover_new_playlists(login, playlists))
 
-    for pl in PLAYLISTS:
-        sync_playlist(login, pl, api_key)
+    for pl in playlists:
+        try:
+            sync_playlist(login, pl, api_key)
+        except Exception as exc:
+            # WHY: one removed or temporarily unavailable discovered playlist must
+            # not prevent the remaining configured playlists from synchronizing.
+            print(
+                f"WARNING: playlist '{pl['name']}' sync failed "
+                f"({type(exc).__name__}: {exc})",
+                flush=True,
+            )
 
     print("\nDone.", flush=True)
 

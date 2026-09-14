@@ -34,8 +34,11 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 ├── downloads.spotdl                       ← spotdl 全局下载记录（自动维护）
 ├── sync_liked.py / sync_liked.sh          ← Liked Songs 同步脚本
 ├── sync_playlists.py / sync_playlists.sh  ← 私有歌单同步脚本
+├── playlist_discovery.py                   ← 新建 Playlist 的安全基线与自动发现
+├── .spotify_playlist_discovery.json        ← 运行时发现状态（原子写入，不进 git）
 ├── lyrics.py                               ← 新增/修复 MP3 的增量歌词下载
 ├── check_cookie.sh                        ← 同步健康检测脚本，基于日志判定（在 git 仓库中）
+├── .playlist_retry_state.json / .liked_retry_state.json ← 缺失歌曲重试计数与通知标记（运行时，不进 git）
 ├── .telegram_config                       ← Telegram Bot Token/Chat ID（600 权限，不进 git）
 ├── fallback_resolver.py                   ← Fallback 纯解析脚本（yt-dlp 搜索，不下载）
 ├── run_fallback_resolver.sh               ← 每日 03:00 cron 自动解析缺失歌曲
@@ -69,15 +72,18 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 
 ### 私有歌单（每 5 分钟）
 
-同步 Mia 的私有 Spotify 歌单，支持歌单设为 private 状态下正常运作。当前同步的歌单在 `sync_playlists.py` 的 `PLAYLISTS` 列表中声明（Mia 告知 Tao 后添加）：
+同步 Mia 的私有 Spotify 歌单，支持歌单设为 private 状态下正常运作。原有明确选择的歌单保留在 `sync_playlists.py` 的 `PLAYLISTS` 列表中；自动发现上线后，Mia 新建且由她本人拥有的 Playlist 会自动加入：
 - 新增歌曲 → 最多 5 分钟后下载到对应子目录
 - 删除歌曲 → 从歌单追踪文件中移除，本地文件同步删除
-- **新歌单**：见下方「如何添加新歌单」
+- **新建 Playlist** → 最多 5 分钟后自动发现并开始同步
+- **基线内的旧 Playlist**：见下方「如何添加基线中已经存在的旧歌单」
 
 | 歌单 | Spotify ID | 本地目录 |
 |------|-----------|---------|
 | Summer 26 | `3ebskb0Uy9zbm87SyemHjG` | `Playlists/summer26/` |
 | Can Dances | `2Rx94JQDRIft0V4Fd9rMq5` | `Playlists/can_dances/` |
+| Calm | `4rYsc7tTRe7UCGY8ajz8k1` | `Playlists/calm/` |
+| Katseye Animal | `3pVbUjpOlKzbTXX77UEvnv` | `Playlists/katseye_animal/` |
 
 | 文件 | 路径 |
 |------|------|
@@ -86,6 +92,21 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 | 日志 | `/volume1/homes/Mia/Music/.spotdl_playlists_sync.log` |
 
 **私有歌单认证方式**：`spotapi.PublicPlaylist(playlist_id, client=login.client)` — 将 sp_dc 认证后的 TLS client 注入 PublicPlaylist，使其可访问私有歌单。
+
+### 自动发现 Mia 新建的 Playlist
+
+`sync_playlists.py` 每 5 分钟读取一次 Mia 的完整 Spotify library，并通过 `playlist_discovery.py` 做安全差分：
+
+- 第一次运行只建立基线：记录当时已有的全部 Playlist ID，**不会**把任何旧歌单自动加入。
+- 之后只接纳基线里没见过、且 `owner_uri` 精确等于 Mia Spotify 用户 ID 的新 Playlist。
+- 新关注的官方/他人 Playlist 只记录为已见、不下载；新 Playlist 若暂时缺少 owner，则延后到下一轮重新判断，不会误收录或永久漏掉。
+- 自动加入后直接复用原同步流程：建立 NAS 子目录和 Jellyfin Playlist、下载歌曲、严格匹配歌词。
+- 自动目录使用清理后的歌单名加 Spotify ID 前 8 位，避免同名碰撞；Jellyfin 同名时也会追加 ID 短后缀。
+- 完整性门：library 返回项目数必须等于 `totalCount`；否则本轮不更新基线、不接纳新歌单。
+- 自动发现状态原子写入 `/volume1/homes/Mia/Music/.spotify_playlist_discovery.json`，并保留上一版 `.bak`。状态损坏时优先恢复备份；两份都不可用时只继续固定名单，不自动接纳。
+- 自动发现的 Playlist 若从 Mia library 消失，只暂停同步并保留 NAS 文件，不自动删除。
+
+2026-08-12 上线基线：Spotify library 共 197 项，其中 65 个 Playlist；首次自动接纳数为 0。
 
 ---
 
@@ -105,9 +126,9 @@ Jellyfin 的实时监控会自动发现 sidecar，Finamp Beta 在播放页显示
 
 ---
 
-### 如何添加新歌单
+### 如何添加基线中已经存在的旧歌单
 
-Mia 告知 Tao 要添加某个 Spotify 歌单后，Tao 执行以下步骤：
+自动发现只处理上线基线之后新建的 Playlist。若 Mia 想添加一个基线中早已存在的旧歌单，仍由 Tao 按以下步骤明确加入，避免把她现有的其他旧歌单误下载：
 
 **第 1 步：找到 Spotify Playlist ID**
 
@@ -163,9 +184,9 @@ scp -O sync_playlists.py nas:/volume1/homes/Mia/Music/sync_playlists.py
 
 ---
 
-### 如何检查 Mia 的 Spotify 库找新歌单
+### 如何检查 Mia 的 Spotify 库找旧歌单候选
 
-背景：2026-07-27 用户反馈之前没有一个明确的流程去检查 Mia 的 Spotify 库里有没有新歌单/未追踪的歌单，导致遗漏。这里记录一遍可重复执行的流程（区别于上面"如何添加新歌单"——那一节讲的是**已确认要加的歌单怎么落地**，这一节讲的是**怎么先找出候选**）。
+背景：2026-07-27 用户反馈之前没有一个明确的流程去检查 Mia 的 Spotify 库里有没有未追踪的旧歌单，导致遗漏。自动发现上线后，新建且由 Mia 拥有的 Playlist 已无需人工检查；这里保留一遍查找基线内旧候选的可重复流程。
 
 **第 1 步：一次性查询 Spotify 库（不是常驻容器）**
 
@@ -179,8 +200,11 @@ from shared import make_login
 import spotapi, json
 
 login = make_login()
-lib = spotapi.PrivatePlaylist(login).get_library()
-items = lib.get("data", {}).get("me", {}).get("libraryV3", {}).get("items", [])
+lib = spotapi.PrivatePlaylist(login).get_library(500)
+library = lib.get("data", {}).get("me", {}).get("libraryV3", {})
+items = library.get("items", [])
+if len(items) != library.get("totalCount"):
+    raise RuntimeError("incomplete Spotify library snapshot")
 for it in items:
     node = it.get("item", {})
     data = node.get("data", {})
@@ -208,7 +232,7 @@ cat /tmp/query_lib.py | ssh nas "cat > /tmp/query_lib.py && sudo /usr/local/bin/
 
 找到候选歌单后，**必须先跟用户确认**，不能因为它出现在库里就默认要同步。先例：2026-07-26 曾经找到好几个未追踪的歌单，最后只确认了 `Calm` 一个要加，其余的都明确按下不动，等待确认。
 
-**第 5 步：确认后按上面"如何添加新歌单"的流程落地**
+**第 5 步：确认后按上面"如何添加基线中已经存在的旧歌单"的流程落地**
 
 简述（详细步骤见上一节，这里不重复）：
 1. 在 `PLAYLISTS` 加一条（省略 `jellyfin_id`，脚本会自动创建 Jellyfin 播放列表）。
@@ -258,7 +282,7 @@ cat /tmp/query_lib.py | ssh nas "cat > /tmp/query_lib.py && sudo /usr/local/bin/
 | Summer 26 | `ed82387a29c7bf3d4703b7d964d94c54` |
 | Can Dances | `313dc8185ed60db38a6a6b42e2321835` |
 
-新增歌单无需填 Jellyfin ID，脚本会自动查找/创建（详见「如何添加新歌单」）。
+新增歌单无需填 Jellyfin ID，脚本会自动查找/创建（基线内旧歌单详见「如何添加基线中已经存在的旧歌单」）。
 
 当两个 Spotify Track ID 指向同一首同艺术家/同专辑/同标题的音频时，本地只保留一个 MP3，Jellyfin playlist XML 会复用同一个路径写出多个播放列表条目，避免 spotDL 因同名文件重复跳过而进入无限重试。
 
@@ -295,6 +319,12 @@ curl -X POST 'http://localhost:8096/Library/VirtualFolders/Name?name=旧名&newN
 ```bash
 sudo /usr/local/bin/docker build --no-cache -t spotdl-local:latest /volume1/docker/spotdl/
 ```
+
+**yt-dlp 必须保持较新**：Dockerfile 在装完 spotDL 后单独 `pip install --upgrade yt-dlp yt-dlp-ejs`。
+YouTube 会频繁改播放器 JS 和音频流签名算法，旧 yt-dlp 仍能读到视频信息，但算出的音频流地址会被拒
+（`ERROR: unable to download video data: HTTP Error 403`）。2026-09-14 事故时 2026.6.9 版本对所有歌 403，
+升级到 2026.8.19 后立即恢复。**判断信号**：日志里大量 `AudioProviderError: YT-DLP download error`
+且原来能下的歌也失败 → 先 rebuild 升级 yt-dlp。升级前给旧镜像打回滚 tag（如 `spotdl-local:pre-ytdlp-YYYYMMDD`）。
 
 ## Cloudflare Tunnel
 
@@ -391,6 +421,21 @@ spotdl download "YouTubeURL|SpotifyURL" --output "{artists}/{album}/{title}"
 ```
 
 下载结果与正常 spotdl 下载**完全一致**（Artist / Album / Cover / WOAS 标签）。
+
+### 来源顺序、重试上限与人工通知（2026-09-14 起）
+
+每首缺失歌曲依次尝试：① spotDL 自动匹配 YouTube Music/YouTube → ② `youtube_fallback_cache.json` 里的链接
+→ ③ Deezer（streamrip 128k，**要求 artist + title 都匹配**，不再盲取第一条结果）。
+
+- **重试上限**：同一首歌所有来源连续失败 3 次后，改为每 24 小时最多重试一次（状态文件
+  `.playlist_retry_state.json`，key=`<歌单目录>:<spotify_id>`；`.liked_retry_state.json`，key=`<spotify_id>`）。
+  下载成功即清除记录。背景：2026-09-14 前永久缺失的歌每 5 分钟重试，每次约 5MB 开销，NAS 流量约 1GB/h 触发 Deco 告警。
+- **人工通知**：达到上限时发一次 Telegram（与 check_cookie.sh 同一 bot，`.telegram_config`），列出「歌手 - 歌名 (ID)」。
+  发送成功才写 `notified: true`，之后不再重复。
+- **收到通知后的人工处理**：用 `yt-dlp --flat-playlist --print "%(duration)s | %(uploader)s | %(title)s | %(url)s" "ytsearch8:<关键词>"`
+  在 spotdl-local 容器里搜，按 Spotify 时长对齐挑候选，写入缓存（`source: "manual"`，resolver 不会覆盖），
+  再从对应 retry state 文件删掉该 key，下一轮就会下载。
+- **想强制立即重试**：删掉 retry state 文件里对应 key（整份删除 = 全部重置）。
 
 ### 关键文件
 
