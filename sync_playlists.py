@@ -356,20 +356,71 @@ def build_disk_id_to_path(folder: pathlib.Path) -> dict[str, pathlib.Path]:
     return result
 
 
-def delete_files_for_ids(folder: pathlib.Path, removed_ids: set[str]) -> int:
-    """Delete files in this playlist folder whose embedded Spotify ID was removed."""
+def build_global_id_to_path() -> dict[str, pathlib.Path]:
+    """Map Spotify ID -> MP3 path for files present in ANY playlist folder.
+
+    WHY: the same song is often on more than one of Mia's playlists. Without this,
+    each playlist downloads its own independent copy — same song, two files with
+    slightly different encodes, which Jellyfin then presents as "alternate
+    versions" of one track (the duplicate-source picker Mia sees in Finamp).
+    Scanning across all playlist folders lets a playlist reuse a file another
+    playlist already has instead of downloading (and storing) a second copy.
+    """
+    return build_disk_id_to_path(MUSIC_DIR / OUTPUT_BASE)
+
+
+def build_global_tracked_ids(
+    all_playlists: list[dict[str, Any]], exclude_folder: str
+) -> set[str]:
+    """Union of song IDs currently saved by every playlist except exclude_folder.
+
+    Used to protect a shared file from deletion: a song removed from one
+    playlist must not be deleted from disk while another playlist still tracks
+    the same Spotify ID there.
+    """
+    ids: set[str] = set()
+    for pl in all_playlists:
+        if pl["folder"] == exclude_folder:
+            continue
+        folder = MUSIC_DIR / OUTPUT_BASE / pl["folder"]
+        save_file = folder / f"{pl['folder']}.spotdl"
+        _, saved_ids = load_save_file(save_file)
+        ids |= saved_ids
+    return ids
+
+
+def delete_files_for_ids(
+    folder: pathlib.Path,
+    removed_ids: set[str],
+    protected_ids: frozenset[str] = frozenset(),
+) -> int:
+    """Delete files in this playlist folder whose embedded Spotify ID was removed.
+
+    IDs in protected_ids are skipped: another playlist still tracks that song
+    and may be the one relying on this exact physical file (cross-playlist reuse).
+    """
     deleted = 0
+    skipped = 0
     for mp3 in folder.rglob("*.mp3"):
-        if song_id_from_file(mp3) in removed_ids:
-            mp3.unlink()
-            deleted += 1
-            for parent in (mp3.parent, mp3.parent.parent):
-                if (
-                    parent != folder
-                    and folder in parent.parents
-                    and not any(parent.iterdir())
-                ):
-                    parent.rmdir()
+        sid = song_id_from_file(mp3)
+        if sid not in removed_ids:
+            continue
+        if sid in protected_ids:
+            skipped += 1
+            continue
+        mp3.unlink()
+        deleted += 1
+        for parent in (mp3.parent, mp3.parent.parent):
+            if (
+                parent != folder
+                and folder in parent.parents
+                and not any(parent.iterdir())
+            ):
+                parent.rmdir()
+    if skipped:
+        print(
+            f"Kept {skipped} files still tracked by another playlist", flush=True
+        )
     return deleted
 
 
@@ -562,6 +613,7 @@ def rebuild_jellyfin_playlist(
     songs: list,
     api_key: str,
     candidates_by_key: dict[tuple[str, str, str], list[tuple[pathlib.Path, str]]],
+    global_id_to_path: dict[str, pathlib.Path] | None = None,
 ) -> None:
     """Rewrite Jellyfin's playlist XML from actual MP3 files every sync run."""
     jellyfin_name = pl.get("jellyfin_name", pl["name"])
@@ -574,15 +626,20 @@ def rebuild_jellyfin_playlist(
         return
 
     id_to_path = build_disk_id_to_path(folder)
+    global_id_to_path = global_id_to_path or {}
     tracked_ids = {s.get("song_id") for s in songs if s.get("song_id")}
     paths = []
     missing_ids = []
     collision_reused = 0
+    cross_playlist_reused = 0
     for song in songs:
         sid = song.get("song_id")
         if not sid:
             continue
         mp3 = id_to_path.get(sid)
+        if not mp3 and sid in global_id_to_path:
+            mp3 = global_id_to_path[sid]
+            cross_playlist_reused += 1
         if not mp3:
             candidates = [
                 path
@@ -625,7 +682,8 @@ def rebuild_jellyfin_playlist(
     print(
         f"Jellyfin playlist '{jellyfin_name}': {len(paths)} items written"
         f" ({len(missing_ids)} tracked files missing"
-        f", {collision_reused} metadata collisions reused)",
+        f", {collision_reused} metadata collisions reused"
+        f", {cross_playlist_reused} cross-playlist files reused)",
         flush=True,
     )
     jellyfin_id = pl.get("jellyfin_id", "")
@@ -633,7 +691,12 @@ def rebuild_jellyfin_playlist(
         notify_jellyfin_refresh(jellyfin_id, api_key)
 
 
-def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
+def sync_playlist(
+    login: spotapi.Login,
+    pl: dict,
+    api_key: str,
+    all_playlists: list[dict[str, Any]],
+) -> None:
     folder = MUSIC_DIR / OUTPUT_BASE / pl["folder"]
     folder.mkdir(parents=True, exist_ok=True)
     try:
@@ -675,6 +738,14 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
         tracked_ids = {s.get("song_id") for s in songs if s.get("song_id")}
         disk_ids = set(build_disk_id_to_path(folder))
         missing_tracked_ids = tracked_ids - disk_ids
+        global_id_to_path = build_global_id_to_path()
+        cross_reused = missing_tracked_ids & set(global_id_to_path)
+        if cross_reused:
+            print(
+                f"Reuse: {len(cross_reused)} files already downloaded by another playlist",
+                flush=True,
+            )
+        missing_tracked_ids -= cross_reused
         candidates_by_key = build_file_key_to_paths(folder)
         missing_tracked_ids -= metadata_collision_satisfied_ids(
             folder, missing_tracked_ids, songs, candidates_by_key
@@ -690,7 +761,12 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
             )
         if jid:
             rebuild_jellyfin_playlist(
-                pl, folder, songs, api_key, build_file_key_to_paths(folder)
+                pl,
+                folder,
+                songs,
+                api_key,
+                build_file_key_to_paths(folder),
+                global_id_to_path,
             )
         try:
             process_changed(lyrics_before, snapshot(folder))
@@ -717,6 +793,7 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
         )
         added_ids = added_ids - add_cooling
     if added_ids:
+        global_id_to_path = build_global_id_to_path()
         id_list = list(added_ids)
         total = (len(id_list) + BATCH_SIZE - 1) // BATCH_SIZE
         for i in range(0, len(id_list), BATCH_SIZE):
@@ -743,17 +820,35 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
             batch_file.unlink(missing_ok=True)
             write_save_file(save_file, songs)
 
+            # WHY: a song already downloaded by another playlist doesn't need a
+            # second copy — skip it in the download call, but still track its
+            # metadata above so this playlist's .spotdl/XML resolve it correctly.
+            reused_ids = {sid for sid in batch_ids if sid in global_id_to_path}
+            download_ids = [sid for sid in batch_ids if sid not in reused_ids]
+            if reused_ids:
+                print(
+                    f"Batch {n}: {len(reused_ids)} already downloaded by another"
+                    " playlist, reusing",
+                    flush=True,
+                )
+
             # cwd=MUSIC_DIR so the "Playlists/{folder}/..." template lands at the
             # right path; cwd=folder would nest a second Playlists/{folder}/ inside.
-            dl_rc = spotdl(
-                "download", *urls, "--output", output_template, cwd=MUSIC_DIR
-            )
+            if download_ids:
+                dl_urls = [
+                    f"https://open.spotify.com/track/{sid}" for sid in download_ids
+                ]
+                dl_rc = spotdl(
+                    "download", *dl_urls, "--output", output_template, cwd=MUSIC_DIR
+                )
+            else:
+                dl_rc = 0
             if dl_rc != 0:
                 # WHY: Scan actual downloaded files with WOAS tags to identify which
                 # songs truly landed. Only roll back IDs that have no corresponding file.
                 # This prevents "one bad song" from blocking 19 good ones in the batch,
                 # and avoids orphaned files that would never be cleaned up.
-                actually_downloaded = set(build_disk_id_to_path(folder))
+                actually_downloaded = set(build_disk_id_to_path(folder)) | reused_ids
 
                 batch_ids_set = {s["song_id"] for s in batch_new if "song_id" in s}
                 failed_ids = batch_ids_set - actually_downloaded
@@ -815,7 +910,10 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
         else:
             songs = [s for s in songs if s.get("song_id") not in removed_ids]
             write_save_file(save_file, songs)
-            deleted = delete_files_for_ids(folder, removed_ids)
+            protected_ids = frozenset(
+                removed_ids & build_global_tracked_ids(all_playlists, pl["folder"])
+            )
+            deleted = delete_files_for_ids(folder, removed_ids, protected_ids)
             print(
                 f"Removed {len(removed_ids)} from DB, deleted {deleted} files",
                 flush=True,
@@ -824,6 +922,14 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
     tracked_ids = {s.get("song_id") for s in songs if s.get("song_id")}
     disk_ids = set(build_disk_id_to_path(folder))
     missing_tracked_ids = tracked_ids - disk_ids
+    global_id_to_path = build_global_id_to_path()
+    cross_reused = missing_tracked_ids & set(global_id_to_path)
+    if cross_reused:
+        print(
+            f"Reuse: {len(cross_reused)} files already downloaded by another playlist",
+            flush=True,
+        )
+    missing_tracked_ids -= cross_reused
     candidates_by_key = build_file_key_to_paths(folder)
     missing_tracked_ids -= metadata_collision_satisfied_ids(
         folder, missing_tracked_ids, songs, candidates_by_key
@@ -890,7 +996,12 @@ def sync_playlist(login: spotapi.Login, pl: dict, api_key: str) -> None:
 
     if jid:
         rebuild_jellyfin_playlist(
-            pl, folder, songs, api_key, build_file_key_to_paths(folder)
+            pl,
+            folder,
+            songs,
+            api_key,
+            build_file_key_to_paths(folder),
+            build_global_id_to_path(),
         )
     try:
         process_changed(lyrics_before, snapshot(folder))
@@ -909,7 +1020,7 @@ def main() -> None:
 
     for pl in playlists:
         try:
-            sync_playlist(login, pl, api_key)
+            sync_playlist(login, pl, api_key, playlists)
         except Exception as exc:
             # WHY: one removed or temporarily unavailable discovered playlist must
             # not prevent the remaining configured playlists from synchronizing.
