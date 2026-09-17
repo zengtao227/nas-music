@@ -17,7 +17,6 @@ import pathlib
 import subprocess
 import time
 import urllib.request
-import xml.etree.ElementTree as ET
 from typing import Any
 
 import mutagen
@@ -42,11 +41,11 @@ from shared import (
 from lyrics import process_changed, snapshot
 
 MUSIC_DIR = pathlib.Path("/music")
-JELLYFIN_PLAYLISTS_DIR = pathlib.Path("/jellyfin_playlists")
 JELLYFIN_MUSIC_PREFIX = "/media/music"
 JELLYFIN_URL = "http://192.168.68.68:8096"
 JELLYFIN_API_KEY_FILE = MUSIC_DIR / ".jellyfin_api_key"
 JELLYFIN_MIA_USER_ID = "9DBDBD21-920F-49E0-86B0-AC5D26D2C63B"
+JELLYFIN_PLAYLIST_BATCH = 50
 RETRY_STATE_FILE = MUSIC_DIR / ".playlist_retry_state.json"
 OUTPUT_BASE = "Playlists"
 BATCH_SIZE = 20
@@ -467,20 +466,6 @@ def retry_missing_downloads(
     return missing_ids - disk_ids
 
 
-def indent_xml(elem: ET.Element, level: int = 0) -> None:
-    """Pretty-print ElementTree output in Jellyfin's simple playlist XML shape."""
-    pad = "\n" + level * "  "
-    if len(elem):
-        if not elem.text or not elem.text.strip():
-            elem.text = pad + "  "
-        for child in elem:
-            indent_xml(child, level + 1)
-        if not child.tail or not child.tail.strip():
-            child.tail = pad
-    if level and (not elem.tail or not elem.tail.strip()):
-        elem.tail = pad
-
-
 def _load_jellyfin_api_key() -> str:
     """Load Jellyfin API key from file; returns empty string on any failure."""
     if not JELLYFIN_API_KEY_FILE.exists():
@@ -502,8 +487,8 @@ def _load_jellyfin_api_key() -> str:
 
 def _jellyfin_api(
     method: str, path: str, api_key: str, body: dict | None = None
-) -> dict | None:
-    """Make a Jellyfin API call; returns parsed JSON dict or None on any error."""
+) -> Any:
+    """Make a Jellyfin API call; returns parsed JSON (or {}) or None on any error."""
     url = f"{JELLYFIN_URL}{path}"
     data = json.dumps(body).encode() if body else None
     req = urllib.request.Request(url, data=data, method=method)
@@ -555,7 +540,7 @@ def get_or_create_jellyfin_id(pl: dict, api_key: str) -> str:
     """Return the Jellyfin playlist ID for pl, creating the playlist if absent.
 
     Returns "" when the ID cannot be determined this run (API error, just created,
-    or no api_key). The caller skips the XML rebuild on "" and retries next run.
+    or no api_key). The caller skips the playlist sync on "" and retries next run.
     Hardcoded jellyfin_id in pl is used as-is with zero network calls.
     """
     hardcoded = pl.get("jellyfin_id", "")
@@ -580,7 +565,7 @@ def get_or_create_jellyfin_id(pl: dict, api_key: str) -> str:
     if new_id:
         print(
             f"Jellyfin playlist '{jellyfin_name}' created ({new_id})"
-            " — XML will be populated on next run",
+            " — items will be added on next run",
             flush=True,
         )
     else:
@@ -591,21 +576,99 @@ def get_or_create_jellyfin_id(pl: dict, api_key: str) -> str:
     return ""
 
 
-def notify_jellyfin_refresh(jellyfin_id: str, api_key: str) -> None:
-    """Tell Jellyfin to reload the playlist so Finamp sees the new item count immediately."""
-    if not api_key:
-        return
-    result = _jellyfin_api(
-        "POST",
-        f"/Items/{jellyfin_id}/Refresh"
-        f"?MetadataRefreshMode=Default"
-        f"&ImageRefreshMode=Default"
-        f"&ReplaceAllImages=false"
-        f"&ReplaceAllMetadata=false",
+def _add_playlist_items(jellyfin_id: str, item_ids: list[str], api_key: str) -> bool:
+    """Append item_ids in order; the API needs the playlist owner's user ID."""
+    users = _jellyfin_api("GET", "/Users", api_key) or []
+    owner_candidates = [JELLYFIN_MIA_USER_ID] + [
+        u["Id"] for u in users if u.get("Id") and u["Id"] != JELLYFIN_MIA_USER_ID
+    ]
+    batches = [
+        item_ids[i : i + JELLYFIN_PLAYLIST_BATCH]
+        for i in range(0, len(item_ids), JELLYFIN_PLAYLIST_BATCH)
+    ]
+    for owner in owner_candidates:
+        path = f"/Playlists/{jellyfin_id}/Items?userId={owner}&ids="
+        if _jellyfin_api("POST", path + ",".join(batches[0]), api_key) is None:
+            continue
+        return all(
+            _jellyfin_api("POST", path + ",".join(batch), api_key) is not None
+            for batch in batches[1:]
+        )
+    return False
+
+
+def sync_jellyfin_playlist_items(
+    jellyfin_id: str, jellyfin_name: str, desired_paths: list[str], api_key: str
+) -> None:
+    """Make a Jellyfin playlist's entries equal desired_paths, in order.
+
+    WHY: since Jellyfin 12 the database is the source of truth for server-managed
+    playlists and playlist.xml is no longer read, so entries are changed through
+    the Playlists API. Nothing is touched when the playlist already matches.
+    """
+    current = _jellyfin_api(
+        "GET",
+        f"/Playlists/{jellyfin_id}/Items?UserId={JELLYFIN_MIA_USER_ID}&Fields=Path",
         api_key,
     )
-    if result is not None:
-        print(f"Jellyfin refresh triggered: {jellyfin_id}", flush=True)
+    if current is None:
+        return
+    current_items = current.get("Items", [])
+    if [item.get("Path") for item in current_items] == desired_paths:
+        return
+
+    library = _jellyfin_api(
+        "GET",
+        "/Items?IncludeItemTypes=Audio&Recursive=true"
+        f"&UserId={JELLYFIN_MIA_USER_ID}&Fields=Path",
+        api_key,
+    )
+    if library is None:
+        return
+    id_by_path = {
+        item["Path"]: item["Id"]
+        for item in library.get("Items", [])
+        if item.get("Path") and item.get("Id")
+    }
+    desired_ids = [id_by_path[p] for p in desired_paths if p in id_by_path]
+    not_indexed = len(desired_paths) - len(desired_ids)
+    # WHY: never empty a playlist just because Jellyfin has not indexed the files
+    # yet (e.g. during a library scan); new downloads are added on a later run.
+    if not_indexed * 2 > len(desired_paths):
+        print(
+            f"WARNING: Jellyfin playlist '{jellyfin_name}': {not_indexed}/"
+            f"{len(desired_paths)} files not indexed yet, skipping update",
+            flush=True,
+        )
+        return
+    if [item.get("Id") for item in current_items] == desired_ids:
+        print(
+            f"Jellyfin playlist '{jellyfin_name}': waiting for {not_indexed}"
+            " new files to be indexed",
+            flush=True,
+        )
+        return
+
+    # WHY: entry IDs equal item IDs, so re-adding before removing would let the
+    # removal delete the new entries too; remove first, then add in order.
+    entry_ids = [item.get("PlaylistItemId") or item["Id"] for item in current_items]
+    for i in range(0, len(entry_ids), JELLYFIN_PLAYLIST_BATCH):
+        batch = ",".join(entry_ids[i : i + JELLYFIN_PLAYLIST_BATCH])
+        path = f"/Playlists/{jellyfin_id}/Items?entryIds={batch}"
+        if _jellyfin_api("DELETE", path, api_key) is None:
+            return
+    if desired_ids and not _add_playlist_items(jellyfin_id, desired_ids, api_key):
+        print(
+            f"WARNING: Jellyfin playlist '{jellyfin_name}': adding items failed,"
+            " will retry next run",
+            flush=True,
+        )
+        return
+    print(
+        f"Jellyfin playlist '{jellyfin_name}' updated:"
+        f" {len(current_items)} -> {len(desired_ids)} items",
+        flush=True,
+    )
 
 
 def rebuild_jellyfin_playlist(
@@ -616,16 +679,8 @@ def rebuild_jellyfin_playlist(
     candidates_by_key: dict[tuple[str, str, str], list[tuple[pathlib.Path, str]]],
     global_id_to_path: dict[str, pathlib.Path] | None = None,
 ) -> None:
-    """Rewrite Jellyfin's playlist XML from actual MP3 files every sync run."""
+    """Sync the Jellyfin playlist to the tracked songs' actual MP3 files."""
     jellyfin_name = pl.get("jellyfin_name", pl["name"])
-    xml_path = JELLYFIN_PLAYLISTS_DIR / jellyfin_name / "playlist.xml"
-    if not xml_path.exists():
-        print(
-            f"WARNING: Jellyfin playlist XML not mounted/found: {xml_path}",
-            flush=True,
-        )
-        return
-
     id_to_path = build_disk_id_to_path(folder)
     global_id_to_path = global_id_to_path or {}
     tracked_ids = {s.get("song_id") for s in songs if s.get("song_id")}
@@ -658,38 +713,16 @@ def rebuild_jellyfin_playlist(
         else:
             missing_ids.append(sid)
 
-    try:
-        tree = ET.parse(xml_path)
-    except ET.ParseError as exc:
-        print(
-            f"WARNING: Jellyfin playlist XML corrupt for '{jellyfin_name}', skipping rebuild: {exc}",
-            flush=True,
-        )
-        return
-    root = tree.getroot()
-    old_items = root.find("PlaylistItems")
-    if old_items is not None:
-        root.remove(old_items)
-    playlist_items = ET.SubElement(root, "PlaylistItems")
-    for path in paths:
-        item = ET.SubElement(playlist_items, "PlaylistItem")
-        path_node = ET.SubElement(item, "Path")
-        path_node.text = path
-
-    indent_xml(root)
-    tmp = xml_path.with_suffix(".tmp")
-    tree.write(tmp, encoding="utf-8", xml_declaration=True)
-    tmp.replace(xml_path)
     print(
-        f"Jellyfin playlist '{jellyfin_name}': {len(paths)} items written"
+        f"Jellyfin playlist '{jellyfin_name}': {len(paths)} items on disk"
         f" ({len(missing_ids)} tracked files missing"
         f", {collision_reused} metadata collisions reused"
         f", {cross_playlist_reused} cross-playlist files reused)",
         flush=True,
     )
     jellyfin_id = pl.get("jellyfin_id", "")
-    if jellyfin_id:
-        notify_jellyfin_refresh(jellyfin_id, api_key)
+    if jellyfin_id and api_key:
+        sync_jellyfin_playlist_items(jellyfin_id, jellyfin_name, paths, api_key)
 
 
 def sync_playlist(

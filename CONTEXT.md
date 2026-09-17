@@ -175,7 +175,7 @@ scp -O sync_playlists.py nas:/volume1/homes/Mia/Music/sync_playlists.py
 | 时间 | 发生的事 |
 |------|---------|
 | 第 1 次 cron（≤5 分钟） | Jellyfin 中自动创建"Winter 26"播放列表；开始下载 Spotify 歌单中的歌曲 |
-| 第 2 次 cron（≤10 分钟） | Jellyfin 播放列表 XML 自动写入已下载的歌曲；触发 Jellyfin 缓存刷新 |
+| 第 2 次 cron（≤10 分钟） | 已下载且已被 Jellyfin 收录的歌曲通过 API 加入 Jellyfin 播放列表 |
 | Finamp | Mia 的 Finamp "Playlists" 标签自动出现新歌单，无需任何手动操作 |
 
 **如果出现警告（需要 Tao 介入）：**
@@ -244,9 +244,9 @@ cat /tmp/query_lib.py | ssh nas "cat > /tmp/query_lib.py && sudo /usr/local/bin/
    ```
    Jellyfin playlist '<Jellyfin 名称>': N items written (0 tracked files missing, ...)
    ```
-   在这行出现之前都不算完成，出现之后（且 `tracked files missing` 为 0）才算真正同步完。第 1 次通常只会创建 Jellyfin 播放列表（日志显示 `... created (...) — XML will be populated on next run`，不写 XML），之后每次重跑都会尝试补齐还没下载成功的曲目，直到全部到位、上面那行 N 等于歌单总曲目数为止——**实测中 2026-07-27 添加 Katseye Animal 时跑了 3 次才完全到位**（第 1 次下载了 18/21 首，第 2 次因 Spotify 端 503 中途崩溃，第 3 次才补完剩下 3 首并写入 XML），不要假设固定 2 次就一定够，也可能因为 Spotify 端瞬时报错（`Could not get session` / `503` 等）需要多跑几次，不代表 cookie 失效或需要人工介入。
+   在这行出现之前都不算完成，出现之后（且 `tracked files missing` 为 0）才算真正同步完。第 1 次通常只会创建 Jellyfin 播放列表（日志显示 `... created (...) — items will be added on next run`），之后每次重跑都会尝试补齐还没下载成功的曲目，直到全部到位、上面那行 N 等于歌单总曲目数为止——**实测中 2026-07-27 添加 Katseye Animal 时跑了 3 次才完全到位**（第 1 次下载了 18/21 首，第 2 次因 Spotify 端 503 中途崩溃，第 3 次才补完剩下 3 首），不要假设固定 2 次就一定够，也可能因为 Spotify 端瞬时报错（`Could not get session` / `503` 等）需要多跑几次，不代表 cookie 失效或需要人工介入。
    - **flock 陷阱**：这个脚本用 `flock -n` 防并发，如果手动执行时刚好撞上 cron 的 5 分钟节点，会静默 `exit 0`，日志里**完全不会出现新的 `Playlist sync started` 行**。每次手动跑完都先确认日志末尾多了一条新的 `started`/`done`，如果没有，说明这次调用被跳过了，直接重新跑一次，而不是误以为"已经跑过一次了"。
-6. 验证：`/volume1/homes/Mia/Music/Playlists/<folder>/` 下出现下载的文件（数量应等于歌单总曲目数），`/volume1/docker/jellyfin/config/data/playlists/` 下出现对应的新文件夹且 `playlist.xml` 里有曲目条目（不是空的 `<Item>` 骨架）。
+6. 验证：`/volume1/homes/Mia/Music/Playlists/<folder>/` 下出现下载的文件（数量应等于歌单总曲目数），日志出现 `Jellyfin playlist '<名字>' updated: 0 -> N items`，且 Jellyfin/Finamp 里该歌单曲目数等于 N。
 
 ---
 
@@ -269,10 +269,12 @@ cat /tmp/query_lib.py | ssh nas "cat > /tmp/query_lib.py && sudo /usr/local/bin/
 
 ### Jellyfin 播放列表
 
-`sync_playlists.sh` 把 Jellyfin playlist XML 目录挂载到容器内的 `/jellyfin_playlists`，`sync_playlists.py` 每次运行结束都会自动：
+`sync_playlists.py` 每次运行结束都会自动：
 1. 在 Jellyfin 中查找或创建对应播放列表（按 `jellyfin_name` 精确匹配）
-2. 按 `.spotdl` 顺序和实际存在的 MP3 重建 Jellyfin playlist XML
-3. 调用 Jellyfin API 触发缓存刷新，Finamp 立刻看到最新曲目数
+2. 按 `.spotdl` 顺序和实际存在的 MP3 算出期望曲目，与 Jellyfin 当前条目比较；一致则什么都不做，不一致才通过官方 Playlists API（先删除旧条目，再按顺序添加）更新
+3. 尚未被 Jellyfin 收录的新文件留到之后的运行再加入；超过一半文件未收录（如全库扫描中）时本轮跳过，绝不清空歌单
+
+**Jellyfin 12 起不再读取 `playlist.xml`**：服务器管理的歌单以数据库 `LinkedChildren` 表为准（源码 `PlaylistMetadataService.MergeData` 注释），改写 XML 或对歌单做 `ReplaceAllMetadata` 刷新都不会恢复条目，后者反而会把空列表写回 XML。2026-09-17 升级时全库扫描曾清空全部 5 个歌单，用备份 XML 里的路径经 API 恢复。
 
 若手机端仍显示旧数量，在 Finamp 设置中用「重新连接」刷新缓存（不要退出登录）。
 
@@ -285,7 +287,7 @@ cat /tmp/query_lib.py | ssh nas "cat > /tmp/query_lib.py && sudo /usr/local/bin/
 
 新增歌单无需填 Jellyfin ID，脚本会自动查找/创建（基线内旧歌单详见「如何添加基线中已经存在的旧歌单」）。
 
-当两个 Spotify Track ID 指向同一首同艺术家/同专辑/同标题的音频时，本地只保留一个 MP3，Jellyfin playlist XML 会复用同一个路径写出多个播放列表条目，避免 spotDL 因同名文件重复跳过而进入无限重试。
+当两个 Spotify Track ID 指向同一首同艺术家/同专辑/同标题的音频时，本地只保留一个 MP3，Jellyfin 播放列表会复用同一个路径作为多个条目，避免 spotDL 因同名文件重复跳过而进入无限重试。
 
 ### Jellyfin API 操作
 

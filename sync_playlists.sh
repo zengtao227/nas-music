@@ -15,7 +15,6 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Playlist sync started" >> "$LOG_FILE"
 
 /usr/local/bin/docker run --rm \
   -v "$MUSIC_DIR":/music \
-  -v /volume1/docker/jellyfin/config/data/playlists:/jellyfin_playlists \
   --entrypoint python3 \
   spotdl-local:latest \
   /music/sync_playlists.py >> "$LOG_FILE" 2>&1

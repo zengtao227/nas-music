@@ -148,39 +148,41 @@ class DeleteFilesForIdsTest(unittest.TestCase):
 
 
 class RebuildJellyfinPlaylistCrossReuseTest(unittest.TestCase):
+    def _rebuild(self, root, folder, songs, global_id_to_path):
+        synced = []
+        with patch.object(sp, "MUSIC_DIR", root), patch.object(
+            sp, "song_id_from_file", _fake_song_id_from_file
+        ), patch.object(
+            sp,
+            "sync_jellyfin_playlist_items",
+            lambda jid, name, paths, key: synced.append(paths),
+        ):
+            sp.rebuild_jellyfin_playlist(
+                pl={"name": "calm", "jellyfin_name": "Calm", "jellyfin_id": "PL"},
+                folder=folder,
+                songs=songs,
+                api_key="key",
+                candidates_by_key={},
+                global_id_to_path=global_id_to_path,
+            )
+        return synced
+
     def test_uses_global_path_when_not_in_own_folder(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             folder = root / "Playlists" / "calm"
             folder.mkdir(parents=True)
-            xml_dir = root / "jellyfin" / "Calm"
-            xml_dir.mkdir(parents=True)
-            xml_path = xml_dir / "playlist.xml"
-            xml_path.write_text(
-                '<?xml version="1.0" encoding="utf-8"?><Item><PlaylistItems />'
-                "</Item>"
-            )
-
             elsewhere = root / "Playlists" / "summer26" / "SZA" / "Kill Bill.mp3"
             elsewhere.parent.mkdir(parents=True)
             elsewhere.write_text("SID1")
 
-            with patch.object(sp, "MUSIC_DIR", root), patch.object(
-                sp, "JELLYFIN_PLAYLISTS_DIR", root / "jellyfin"
-            ), patch.object(sp, "song_id_from_file", _fake_song_id_from_file):
-                sp.rebuild_jellyfin_playlist(
-                    pl={"name": "calm", "jellyfin_name": "Calm"},
-                    folder=folder,
-                    songs=[{"song_id": "SID1"}],
-                    api_key="",
-                    candidates_by_key={},
-                    global_id_to_path={"SID1": elsewhere},
-                )
+            synced = self._rebuild(
+                root, folder, [{"song_id": "SID1"}], {"SID1": elsewhere}
+            )
 
-            written = xml_path.read_text()
-            self.assertIn(
-                f"{sp.JELLYFIN_MUSIC_PREFIX}/Playlists/summer26/SZA/Kill Bill.mp3",
-                written,
+            self.assertEqual(
+                synced,
+                [[f"{sp.JELLYFIN_MUSIC_PREFIX}/Playlists/summer26/SZA/Kill Bill.mp3"]],
             )
 
     def test_missing_everywhere_stays_missing(self):
@@ -188,28 +190,93 @@ class RebuildJellyfinPlaylistCrossReuseTest(unittest.TestCase):
             root = Path(tmp)
             folder = root / "Playlists" / "calm"
             folder.mkdir(parents=True)
-            xml_dir = root / "jellyfin" / "Calm"
-            xml_dir.mkdir(parents=True)
-            xml_path = xml_dir / "playlist.xml"
-            xml_path.write_text(
-                '<?xml version="1.0" encoding="utf-8"?><Item><PlaylistItems />'
-                "</Item>"
+
+            synced = self._rebuild(root, folder, [{"song_id": "SID_GONE"}], {})
+
+            self.assertEqual(synced, [[]])
+
+
+class FakeJellyfin:
+    """Records Playlists API calls against an in-memory playlist and library."""
+
+    def __init__(self, entries, library, owner=sp.JELLYFIN_MIA_USER_ID):
+        self.entries = list(entries)
+        self.library = library
+        self.owner = owner
+        self.writes = []
+
+    def __call__(self, method, path, api_key, body=None):
+        if method == "GET" and path.startswith("/Playlists/"):
+            return {
+                "Items": [
+                    {"Id": i, "PlaylistItemId": i, "Path": self.library[i]}
+                    for i in self.entries
+                ]
+            }
+        if method == "GET" and path.startswith("/Items"):
+            return {"Items": [{"Id": i, "Path": p} for i, p in self.library.items()]}
+        if method == "GET" and path == "/Users":
+            return [{"Id": sp.JELLYFIN_MIA_USER_ID}, {"Id": "ADMIN"}]
+        self.writes.append((method, path))
+        query = dict(part.split("=", 1) for part in path.split("?", 1)[1].split("&"))
+        if method == "DELETE":
+            gone = set(query["entryIds"].split(","))
+            self.entries = [i for i in self.entries if i not in gone]
+            return {}
+        if method == "POST":
+            if query["userId"] != self.owner:
+                return None
+            self.entries.extend(query["ids"].split(","))
+            return {}
+        raise AssertionError(f"unexpected call {method} {path}")
+
+
+class SyncJellyfinPlaylistItemsTest(unittest.TestCase):
+    LIBRARY = {"A": "/media/music/a.mp3", "B": "/media/music/b.mp3", "C": "/media/music/c.mp3"}
+
+    def _sync(self, fake, desired_ids):
+        desired_paths = [self.LIBRARY[i] for i in desired_ids]
+        with patch.object(sp, "_jellyfin_api", fake):
+            sp.sync_jellyfin_playlist_items("PL", "Calm", desired_paths, "key")
+
+    def test_matching_playlist_is_not_touched(self):
+        fake = FakeJellyfin(["A", "B"], self.LIBRARY)
+        self._sync(fake, ["A", "B"])
+        self.assertEqual(fake.writes, [])
+
+    def test_changed_playlist_is_replaced_in_order(self):
+        fake = FakeJellyfin(["A", "B"], self.LIBRARY)
+        self._sync(fake, ["C", "A"])
+        self.assertEqual(fake.entries, ["C", "A"])
+        self.assertEqual(fake.writes[0][0], "DELETE")
+
+    def test_does_not_empty_playlist_when_files_not_indexed(self):
+        fake = FakeJellyfin(["A", "B"], self.LIBRARY)
+        with patch.object(sp, "_jellyfin_api", fake):
+            sp.sync_jellyfin_playlist_items(
+                "PL",
+                "Calm",
+                ["/media/music/new1.mp3", "/media/music/new2.mp3", self.LIBRARY["A"]],
+                "key",
             )
+        self.assertEqual(fake.writes, [])
+        self.assertEqual(fake.entries, ["A", "B"])
 
-            with patch.object(sp, "MUSIC_DIR", root), patch.object(
-                sp, "JELLYFIN_PLAYLISTS_DIR", root / "jellyfin"
-            ), patch.object(sp, "song_id_from_file", _fake_song_id_from_file):
-                sp.rebuild_jellyfin_playlist(
-                    pl={"name": "calm", "jellyfin_name": "Calm"},
-                    folder=folder,
-                    songs=[{"song_id": "SID_GONE"}],
-                    api_key="",
-                    candidates_by_key={},
-                    global_id_to_path={},
-                )
+    def test_waits_for_unindexed_new_file_without_rewriting(self):
+        fake = FakeJellyfin(["A", "B"], self.LIBRARY)
+        with patch.object(sp, "_jellyfin_api", fake):
+            sp.sync_jellyfin_playlist_items(
+                "PL",
+                "Calm",
+                [self.LIBRARY["A"], self.LIBRARY["B"], "/media/music/new.mp3"],
+                "key",
+            )
+        self.assertEqual(fake.writes, [])
 
-            written = xml_path.read_text()
-            self.assertNotIn(sp.JELLYFIN_MUSIC_PREFIX, written)
+    def test_adds_with_playlist_owner_when_not_owned_by_mia(self):
+        fake = FakeJellyfin(["A"], self.LIBRARY, owner="ADMIN")
+        self._sync(fake, ["A", "B"])
+        self.assertEqual(fake.entries, ["A", "B"])
 
 
 if __name__ == "__main__":
