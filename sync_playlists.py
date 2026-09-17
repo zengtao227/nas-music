@@ -751,7 +751,8 @@ def sync_playlist(
     pl: dict,
     api_key: str,
     all_playlists: list[dict[str, Any]],
-) -> None:
+) -> bool:
+    """Sync one playlist; returns True if new songs were downloaded this run."""
     folder = MUSIC_DIR / OUTPUT_BASE / pl["folder"]
     folder.mkdir(parents=True, exist_ok=True)
     try:
@@ -829,7 +830,7 @@ def sync_playlist(
             print(
                 f"WARNING: lyrics processing failed ({type(exc).__name__})", flush=True
             )
-        return
+        return False
 
     # --- add new songs ---
     # WHY: failed new songs are rolled back out of the .spotdl and reappear as
@@ -1062,6 +1063,7 @@ def sync_playlist(
         process_changed(lyrics_before, snapshot(folder))
     except Exception as exc:
         print(f"WARNING: lyrics processing failed ({type(exc).__name__})", flush=True)
+    return bool(added_ids)
 
 
 def main() -> None:
@@ -1073,9 +1075,11 @@ def main() -> None:
     playlists: list[dict[str, Any]] = [dict(playlist) for playlist in PLAYLISTS]
     playlists.extend(discover_new_playlists(login, playlists))
 
+    downloaded_new = False
     for pl in playlists:
         try:
-            sync_playlist(login, pl, api_key, playlists)
+            if sync_playlist(login, pl, api_key, playlists):
+                downloaded_new = True
         except Exception as exc:
             # WHY: one removed or temporarily unavailable discovered playlist must
             # not prevent the remaining configured playlists from synchronizing.
@@ -1084,6 +1088,17 @@ def main() -> None:
                 f"({type(exc).__name__}: {exc})",
                 flush=True,
             )
+
+    # WHY (2026-09-17): Jellyfin's RealtimeMonitor debounces refreshes per watched
+    # folder. A playlist sync spanning many minutes across several playlist
+    # subfolders keeps resetting that debounce timer, so the automatic scan never
+    # gets a quiet gap to run — confirmed via Jellyfin logs when a 94-song first
+    # sync left files undiscovered for over an hour. Trigger one explicit scan
+    # whenever this run actually downloaded something, instead of relying on the
+    # 12-hour scheduled scan or a debounce window that may never open.
+    if downloaded_new:
+        if _jellyfin_api("POST", "/Library/Refresh", api_key) is not None:
+            print("Triggered Jellyfin library refresh (new songs downloaded)", flush=True)
 
     print("\nDone.", flush=True)
 
