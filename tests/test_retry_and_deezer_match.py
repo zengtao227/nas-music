@@ -181,5 +181,37 @@ class DiagnosisTest(unittest.TestCase):
         self.assertEqual(shared.song_label({"artist": "A", "name": "B"}), "A - B")
 
 
+class MoveToArtistAlbumFolderTest(unittest.TestCase):
+    def _tagged(self, path, artist, album, title):
+        import mutagen.id3 as id3
+
+        path.write_bytes(b"\xff\xfb" + b"\x00" * 64)
+        tags = id3.ID3()
+        tags.add(id3.TPE1(encoding=3, text=[artist]))
+        tags.add(id3.TALB(encoding=3, text=[album]))
+        tags.add(id3.TIT2(encoding=3, text=[title]))
+        tags.save(path)
+
+    def test_moves_flat_download_into_artist_album_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            flat = base / "01. LISA - Rockstar.mp3"
+            self._tagged(flat, "LISA/Tyla", "Alter: Ego", "Rock?star")
+            moved = shared.move_to_artist_album_folder(flat, base)
+            self.assertEqual(moved, base / "LISA, Tyla" / "Alter_ Ego" / "Rock_star.mp3")
+            self.assertTrue(moved.exists())
+            self.assertFalse(flat.exists())
+
+    def test_keeps_file_when_target_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            flat = base / "01. A - T.mp3"
+            self._tagged(flat, "A", "B", "T")
+            (base / "A" / "B").mkdir(parents=True)
+            (base / "A" / "B" / "T.mp3").write_text("existing")
+            self.assertEqual(shared.move_to_artist_album_folder(flat, base), flat)
+            self.assertTrue(flat.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -362,6 +362,9 @@ def deezer_fallback(
         text = config_path.read_text()
         text = text.replace('arl = ""', f'arl = "{arl}"')
         text = text.replace('folder = "/root/StreamripDownloads"', 'folder = "."')
+        # WHY: a separate cover.jpg lands in the library folder and Jellyfin uses
+        # it as the folder image; the cover is already embedded in the MP3.
+        text = text.replace("save_artwork = true", "save_artwork = false")
         lines = text.split("\n")
         in_deezer = False
         for i, line in enumerate(lines):
@@ -402,4 +405,41 @@ def deezer_fallback(
                 tags.save()
         except Exception:
             pass
+        move_to_artist_album_folder(mp3s[0], base_dir)
     return True
+
+
+def _safe_path_part(value: str) -> str:
+    return re.sub(r'[/\\:*?"<>|\x00]', "_", value).strip().strip(".")
+
+
+def move_to_artist_album_folder(mp3: pathlib.Path, base_dir: pathlib.Path) -> pathlib.Path:
+    """Move a flat streamrip download to base_dir/{artists}/{album}/{title}.mp3.
+
+    WHY: streamrip saves singles flat as "01. Artist - Title.mp3" in base_dir,
+    unlike spotDL's artist/album/title layout; loose files in the library root
+    and playlist folders confuse Jellyfin's folder-based album detection.
+    Leaves the file in place when tags are incomplete or the target exists.
+    """
+    try:
+        tags = mutagen.id3.ID3(mp3)
+    except Exception:
+        return mp3
+    artist = ", ".join(
+        part.strip()
+        for frame in tags.getall("TPE1")
+        for text in frame.text
+        for part in str(text).split("/")
+        if part.strip()
+    )
+    album = str(tags["TALB"].text[0]) if tags.get("TALB") else ""
+    title = str(tags["TIT2"].text[0]) if tags.get("TIT2") else ""
+    parts = [_safe_path_part(v) for v in (artist, album, title)]
+    if not all(parts):
+        return mp3
+    target = base_dir / parts[0] / parts[1] / f"{parts[2]}.mp3"
+    if target.exists():
+        return mp3
+    target.parent.mkdir(parents=True, exist_ok=True)
+    mp3.replace(target)
+    return target
