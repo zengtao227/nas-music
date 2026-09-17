@@ -204,8 +204,9 @@ class FakeJellyfin:
         self.library = library
         self.owner = owner
         self.writes = []
+        self.add_limit = None
 
-    def __call__(self, method, path, api_key, body=None):
+    def __call__(self, method, path, api_key, body=None, warn=True):
         if method == "GET" and path.startswith("/Playlists/"):
             return {
                 "Items": [
@@ -226,7 +227,7 @@ class FakeJellyfin:
         if method == "POST":
             if query["userId"] != self.owner:
                 return None
-            self.entries.extend(query["ids"].split(","))
+            self.entries.extend(query["ids"].split(",")[: self.add_limit])
             return {}
         raise AssertionError(f"unexpected call {method} {path}")
 
@@ -272,6 +273,14 @@ class SyncJellyfinPlaylistItemsTest(unittest.TestCase):
                 "key",
             )
         self.assertEqual(fake.writes, [])
+
+    def test_partial_add_is_reported(self):
+        fake = FakeJellyfin(["A"], self.LIBRARY)
+        fake.add_limit = 1
+        with patch("builtins.print") as printed:
+            self._sync(fake, ["A", "B"])
+        messages = " ".join(str(c.args[0]) for c in printed.call_args_list)
+        self.assertIn("read-back has 1 items, expected 2", messages)
 
     def test_adds_with_playlist_owner_when_not_owned_by_mia(self):
         fake = FakeJellyfin(["A"], self.LIBRARY, owner="ADMIN")

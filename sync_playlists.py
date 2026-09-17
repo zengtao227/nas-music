@@ -486,7 +486,7 @@ def _load_jellyfin_api_key() -> str:
 
 
 def _jellyfin_api(
-    method: str, path: str, api_key: str, body: dict | None = None
+    method: str, path: str, api_key: str, body: dict | None = None, warn: bool = True
 ) -> Any:
     """Make a Jellyfin API call; returns parsed JSON (or {}) or None on any error."""
     url = f"{JELLYFIN_URL}{path}"
@@ -502,7 +502,8 @@ def _jellyfin_api(
             raw = resp.read()
             return json.loads(raw) if raw.strip() else {}
     except Exception as exc:
-        print(f"WARNING: Jellyfin API {method} {path} failed: {exc}", flush=True)
+        if warn:
+            print(f"WARNING: Jellyfin API {method} {path} failed: {exc}", flush=True)
         return None
 
 
@@ -579,8 +580,9 @@ def get_or_create_jellyfin_id(pl: dict, api_key: str) -> str:
 def _add_playlist_items(jellyfin_id: str, item_ids: list[str], api_key: str) -> bool:
     """Append item_ids in order; the API needs the playlist owner's user ID."""
     users = _jellyfin_api("GET", "/Users", api_key) or []
+    mia = JELLYFIN_MIA_USER_ID.replace("-", "").lower()
     owner_candidates = [JELLYFIN_MIA_USER_ID] + [
-        u["Id"] for u in users if u.get("Id") and u["Id"] != JELLYFIN_MIA_USER_ID
+        u["Id"] for u in users if u.get("Id") and u["Id"].replace("-", "").lower() != mia
     ]
     batches = [
         item_ids[i : i + JELLYFIN_PLAYLIST_BATCH]
@@ -588,7 +590,9 @@ def _add_playlist_items(jellyfin_id: str, item_ids: list[str], api_key: str) -> 
     ]
     for owner in owner_candidates:
         path = f"/Playlists/{jellyfin_id}/Items?userId={owner}&ids="
-        if _jellyfin_api("POST", path + ",".join(batches[0]), api_key) is None:
+        # WHY: the API exposes no owner to an API key, so a non-owner is expected
+        # to be refused here; only the caller warns when every candidate fails.
+        if _jellyfin_api("POST", path + ",".join(batches[0]), api_key, warn=False) is None:
             continue
         return all(
             _jellyfin_api("POST", path + ",".join(batch), api_key) is not None
@@ -661,6 +665,17 @@ def sync_jellyfin_playlist_items(
         print(
             f"WARNING: Jellyfin playlist '{jellyfin_name}': adding items failed,"
             " will retry next run",
+            flush=True,
+        )
+        return
+    after = _jellyfin_api(
+        "GET", f"/Playlists/{jellyfin_id}/Items?UserId={JELLYFIN_MIA_USER_ID}", api_key
+    )
+    after_ids = [item.get("Id") for item in (after or {}).get("Items", [])]
+    if after_ids != desired_ids:
+        print(
+            f"WARNING: Jellyfin playlist '{jellyfin_name}': read-back has"
+            f" {len(after_ids)} items, expected {len(desired_ids)}; will retry next run",
             flush=True,
         )
         return
