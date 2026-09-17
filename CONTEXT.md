@@ -116,14 +116,18 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 `sync_liked.py` 和 `sync_playlists.py` 在每轮同步前后记录 MP3 的 inode、大小和修改时间，只把本轮新增或替换的文件交给 `lyrics.py`。因此 Mia Like 新歌或向已配置的 Spotify 歌单加歌后，最多 5 分钟内会同时下载 MP3，并在 LRCLIB 有严格匹配时生成同名歌词文件：
 
 - 有时间轴的歌词写为 `.lrc`，只有纯文本时写为 `.txt`
-- 查询必须匹配 title、artist、album、duration，远端时长与 MP3 相差超过 3 秒即拒绝
+- 第一阶段 `/api/get` 必须匹配 title、artist、album、duration，远端时长与 MP3 相差超过 3 秒即拒绝
+- 第一阶段 404 时进入第二阶段 `/api/search`（2026-09-17 起）：不要求专辑一致（LRCLIB 常把同一首歌挂在别的专辑版本下），但歌名（忽略括号注释和 `- From/Remaster/Live/feat` 后缀）、第一位艺人、时长 ±3 秒仍必须一致；优先带时间轴的，纯音乐不写
+- MP3 已内嵌歌词（USLT/SYLT）时不再写 sidecar，避免重复显示
 - 已有 `.lrc`、`.elrc` 或 `.txt` 一律不覆盖；MP3 本体不修改
 - 单次请求超时 10 秒、最多重试 1 次；无匹配、限流或网络失败只写入 `Lyrics:` 计数，不影响歌曲同步结果
 - Liked Songs 扫描明确排除 `Playlists/`；每个私有歌单只处理自己的目录
 
-Jellyfin 的实时监控会自动发现 sidecar，Finamp Beta 在播放页显示同步歌词。官方 `LrcLib Lyrics` v3 插件仍已安装，但 Jellyfin 10.11.11 上的 provider 查询返回 0 candidates，因此新增歌曲使用仓库内的严格直连模块，而不是依赖插件 scheduled task。
+Jellyfin 的实时监控会自动发现 sidecar，Finamp Beta 在播放页显示同步歌词。`LrcLib Lyrics` 插件仍安装着（Jellyfin 12.1 升级时自动更新到 5.0.0.0；在 10.11.11 上 provider 查询返回 0 candidates），但歌词不依赖插件，由仓库内的严格直连模块处理。
 
 2026-08-08 的历史全库回填结果为 992/1172 首有歌词（935 个 `.lrc`、57 个 `.txt`）；自动流程只处理以后新增或修复的 MP3，不会每 5 分钟重复查询历史无匹配歌曲。部署前脚本备份位于 `/volume1/homes/Mia/Music/.backups/automatic-lyrics-20260808T135132Z/`。
+
+2026-09-17 加入第二阶段后又对全库做了一次回填：新增 39 个歌词文件（33 个 `.lrc`、6 个 `.txt`），新文件清单在 `.backups/lyrics-search-backfill-*.list`。回填后 1251 首里 1116 首有歌词文件、另有 4 首只有内嵌歌词；剩下的主要是 LRCLIB 库里没有（约 100 首，多为中文/韩文说唱和冷门混音）、纯音乐，或时长对不上的其他版本（按规则拒绝）。
 
 ---
 
@@ -428,7 +432,7 @@ spotdl download "YouTubeURL|SpotifyURL" --output "{artists}/{album}/{title}"
 ### 来源顺序、重试上限与人工通知（2026-09-14 起）
 
 每首缺失歌曲依次尝试：① spotDL 自动匹配 YouTube Music/YouTube → ② `youtube_fallback_cache.json` 里的链接
-→ ③ Deezer（streamrip 128k，**要求 artist + title 都匹配**，不再盲取第一条结果）。
+→ ③ Deezer（streamrip 128k，**要求 artist + title 都匹配**，不再盲取第一条结果）。streamrip 默认把单曲平铺存成 `01. 歌手 - 歌名.mp3` 并另存 `cover.jpg`；2026-09-17 起下载后按 ID3 标签移到 `{artists}/{album}/{title}.mp3`，并关闭 `save_artwork`（封面已内嵌）。同日把 Music 根目录此前平铺的 50 首整理完：48 首移入 歌手/专辑 目录（歌词文件一起移），LISA《When I'm With You》根目录副本是同一首歌的非规范副本、Djinotan《New Religion》不在 Liked 也不在任何歌单，二者连同根目录 `cover.jpg` 移到 `.backups/root-cleanup-20260917T134813/`（含 manifest.json，可按清单还原）。
 
 - **重试上限**：同一首歌所有来源连续失败 3 次后，改为每 24 小时最多重试一次（状态文件
   `.playlist_retry_state.json`，key=`<歌单目录>:<spotify_id>`；`.liked_retry_state.json`，key=`<spotify_id>`）。
@@ -449,7 +453,7 @@ spotdl download "YouTubeURL|SpotifyURL" --output "{artists}/{album}/{title}"
 |------|------|
 | `youtube_fallback_cache.json` | Spotify Track ID → YouTube URL 解析缓存（resolver 写入，sync_liked 消费） |
 | `fallback_resolver.py` | 纯解析脚本：yt-dlp 搜索并写入缓存，不下载音频 |
-| `missing_ids.json` | sync_liked.py 写出的待解析 ID 列表，resolver 读取此文件 |
+| `missing_ids.json` | sync_liked.py 写出的待解析 ID 列表，resolver 读取此文件；内容不变时不重写（文件在 Jellyfin 监控的库根目录，每次写入都会触发整库重扫） |
 
 ### youtube_fallback_cache.json 结构
 

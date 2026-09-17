@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import secrets
 import time
+import unicodedata
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Callable
@@ -16,12 +18,15 @@ from urllib.request import Request, urlopen
 
 try:
     from mutagen.easyid3 import EasyID3
+    from mutagen.id3 import ID3
     from mutagen.mp3 import MP3
 except ModuleNotFoundError:
     EasyID3 = None
+    ID3 = None
     MP3 = None
 
 API = "https://lrclib.net/api/get"
+API_SEARCH = "https://lrclib.net/api/search"
 
 
 @dataclass(frozen=True)
@@ -111,47 +116,15 @@ def _write(path: Path, text: str) -> bool:
         temporary.unlink(missing_ok=True)
 
 
-def _fetch(
-    meta: tuple[str, str, str, float], request: Callable[..., Any] = urlopen
-) -> tuple[str, str | None]:
-    title, artist, album, duration = meta
-    if not math.isfinite(duration) or duration <= 0:
-        return "rejected", None
-    url = (
-        API
-        + "?"
-        + urlencode(
-            {
-                "track_name": title,
-                "artist_name": artist,
-                "album_name": album,
-                "duration": round(duration),
-            }
-        )
-    )
+def _request_json(url: str, request: Callable[..., Any]) -> tuple[str, Any]:
+    """GET url with one retry; returns ("ok", payload), ("no_match", None) or ("error", None)."""
     for attempt in range(2):
         try:
             with request(
                 Request(url, headers={"User-Agent": "nas-music-lyrics-sync/1.0"}),
                 timeout=10,
             ) as response:
-                payload = json.loads(response.read())
-            if not isinstance(payload, dict):
-                return "rejected", None
-            response_duration = payload.get("duration")
-            if (
-                isinstance(response_duration, bool)
-                or not isinstance(response_duration, (int, float))
-                or not math.isfinite(float(response_duration))
-                or abs(float(response_duration) - duration) > 3
-            ):
-                return "rejected", None
-            synced, plain = payload.get("syncedLyrics"), payload.get("plainLyrics")
-            if isinstance(synced, str) and synced.strip():
-                return "synced", synced
-            if isinstance(plain, str) and plain.strip():
-                return "plain", plain
-            return "rejected", None
+                return "ok", json.loads(response.read())
         except HTTPError as error:
             if error.code == 404:
                 return "no_match", None
@@ -174,6 +147,103 @@ def _fetch(
     return "error", None
 
 
+def _duration_ok(value: Any, duration: float) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        and abs(float(value) - duration) <= 3
+    )
+
+
+def _lyrics_of(payload: dict) -> tuple[str, str | None]:
+    synced, plain = payload.get("syncedLyrics"), payload.get("plainLyrics")
+    if isinstance(synced, str) and synced.strip():
+        return "synced", synced
+    if isinstance(plain, str) and plain.strip():
+        return "plain", plain
+    return "rejected", None
+
+
+def _normalized(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    text = re.sub(r"\s*[\(\[].*?[\)\]]", "", text)
+    text = re.sub(r"\s+-\s+(from|remaster|live|feat).*$", "", text)
+    return re.sub(r"[^\w]+", " ", text).strip()
+
+
+def _search(
+    meta: tuple[str, str, str, float], request: Callable[..., Any]
+) -> tuple[str, str | None]:
+    """Second stage for songs /api/get cannot match exactly (usually album name).
+
+    WHY: many tracks are catalogued on LRCLIB under a different album release.
+    Album is dropped, but the title (ignoring bracketed notes), the first artist
+    and the duration (within 3 s) must still agree, so a different recording of
+    the same song is not accepted.
+    """
+    title, artist, _album, duration = meta
+    first_artist = re.split(r",|&|/| feat", artist)[0].strip()
+    url = API_SEARCH + "?" + urlencode({"track_name": title, "artist_name": first_artist})
+    status, payload = _request_json(url, request)
+    if status != "ok":
+        return status, None
+    if not isinstance(payload, list):
+        return "rejected", None
+    candidates = [
+        item
+        for item in payload
+        if isinstance(item, dict)
+        and _duration_ok(item.get("duration"), duration)
+        and _normalized(item.get("trackName")) == _normalized(title)
+        and _normalized(first_artist) in _normalized(item.get("artistName"))
+    ]
+    results = [_lyrics_of(item) for item in candidates]
+    for kind in ("synced", "plain"):
+        for result in results:
+            if result[0] == kind:
+                return result
+    return "no_match", None
+
+
+def _fetch(
+    meta: tuple[str, str, str, float], request: Callable[..., Any] = urlopen
+) -> tuple[str, str | None]:
+    title, artist, album, duration = meta
+    if not math.isfinite(duration) or duration <= 0:
+        return "rejected", None
+    url = (
+        API
+        + "?"
+        + urlencode(
+            {
+                "track_name": title,
+                "artist_name": artist,
+                "album_name": album,
+                "duration": round(duration),
+            }
+        )
+    )
+    status, payload = _request_json(url, request)
+    if status == "no_match":
+        return _search(meta, request)
+    if status != "ok":
+        return status, None
+    if not isinstance(payload, dict) or not _duration_ok(payload.get("duration"), duration):
+        return "rejected", None
+    return _lyrics_of(payload)
+
+
+def _has_embedded_lyrics(path: Path) -> bool:
+    if ID3 is None:
+        return False
+    try:
+        tags = ID3(path)
+    except Exception:
+        return False
+    return bool(tags.getall("USLT") or tags.getall("SYLT"))
+
+
 def process_changed(
     before: dict[Path, Fingerprint] | None, after: dict[Path, Fingerprint] | None
 ) -> Summary:
@@ -182,7 +252,8 @@ def process_changed(
     last = 0.0
     for path in sorted(changed_files(before, after)):
         summary.changed += 1
-        if any(
+        # WHY: embedded lyrics already show in Jellyfin; a sidecar would duplicate them.
+        if _has_embedded_lyrics(path) or any(
             path.with_suffix(suffix).exists() for suffix in (".lrc", ".elrc", ".txt")
         ):
             summary.existing += 1
