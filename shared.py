@@ -24,6 +24,49 @@ SP_DC_FILE = MUSIC_DIR / ".spotify_sp_dc"
 DEEZER_ARL_FILE = MUSIC_DIR / ".deezer_arl"
 FALLBACK_MAP_FILE = MUSIC_DIR / "youtube_fallback_cache.json"
 TELEGRAM_CONFIG_FILE = MUSIC_DIR / ".telegram_config"
+JELLYFIN_URL = "http://192.168.68.68:8096"
+JELLYFIN_API_KEY_FILE = MUSIC_DIR / ".jellyfin_api_key"
+
+
+def load_jellyfin_api_key() -> str:
+    """Load Jellyfin API key from file; returns empty string on any failure."""
+    if not JELLYFIN_API_KEY_FILE.exists():
+        print(
+            f"WARNING: Jellyfin API key file missing ({JELLYFIN_API_KEY_FILE})",
+            flush=True,
+        )
+        return ""
+    try:
+        key = JELLYFIN_API_KEY_FILE.read_text().strip()
+    except OSError as exc:
+        print(f"WARNING: Cannot read Jellyfin API key: {exc}", flush=True)
+        return ""
+    if not key:
+        print("WARNING: Jellyfin API key file is empty", flush=True)
+        return ""
+    return key
+
+
+def jellyfin_api(
+    method: str, path: str, api_key: str, body: dict | None = None, warn: bool = True
+) -> Any:
+    """Make a Jellyfin API call; returns parsed JSON (or {}) or None on any error."""
+    url = f"{JELLYFIN_URL}{path}"
+    data = json.dumps(body).encode() if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    # WHY: Jellyfin 12 disables the legacy X-MediaBrowser-Token header by default.
+    req.add_header("Authorization", f'MediaBrowser Token="{api_key}"')
+    req.add_header("Content-Type", "application/json")
+    if data is None:
+        req.add_header("Content-Length", "0")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw.strip() else {}
+    except Exception as exc:
+        if warn:
+            print(f"WARNING: Jellyfin API {method} {path} failed: {exc}", flush=True)
+        return None
 
 
 def make_login() -> spotapi.Login:

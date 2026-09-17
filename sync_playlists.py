@@ -16,7 +16,6 @@ import json
 import pathlib
 import subprocess
 import time
-import urllib.request
 from typing import Any
 
 import mutagen
@@ -28,7 +27,9 @@ from playlist_discovery import (
 )
 from shared import (
     deezer_fallback,
+    jellyfin_api as _jellyfin_api,
     load_fallback_map,
+    load_jellyfin_api_key as _load_jellyfin_api_key,
     load_retry_state,
     make_login,
     notify_exhausted_retries,
@@ -42,8 +43,6 @@ from lyrics import process_changed, snapshot
 
 MUSIC_DIR = pathlib.Path("/music")
 JELLYFIN_MUSIC_PREFIX = "/media/music"
-JELLYFIN_URL = "http://192.168.68.68:8096"
-JELLYFIN_API_KEY_FILE = MUSIC_DIR / ".jellyfin_api_key"
 JELLYFIN_MIA_USER_ID = "9DBDBD21-920F-49E0-86B0-AC5D26D2C63B"
 JELLYFIN_PLAYLIST_BATCH = 50
 RETRY_STATE_FILE = MUSIC_DIR / ".playlist_retry_state.json"
@@ -472,47 +471,6 @@ def retry_missing_downloads(
     return missing_ids - disk_ids
 
 
-def _load_jellyfin_api_key() -> str:
-    """Load Jellyfin API key from file; returns empty string on any failure."""
-    if not JELLYFIN_API_KEY_FILE.exists():
-        print(
-            f"WARNING: Jellyfin API key file missing ({JELLYFIN_API_KEY_FILE})",
-            flush=True,
-        )
-        return ""
-    try:
-        key = JELLYFIN_API_KEY_FILE.read_text().strip()
-    except OSError as exc:
-        print(f"WARNING: Cannot read Jellyfin API key: {exc}", flush=True)
-        return ""
-    if not key:
-        print("WARNING: Jellyfin API key file is empty", flush=True)
-        return ""
-    return key
-
-
-def _jellyfin_api(
-    method: str, path: str, api_key: str, body: dict | None = None, warn: bool = True
-) -> Any:
-    """Make a Jellyfin API call; returns parsed JSON (or {}) or None on any error."""
-    url = f"{JELLYFIN_URL}{path}"
-    data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(url, data=data, method=method)
-    # WHY: Jellyfin 12 disables the legacy X-MediaBrowser-Token header by default.
-    req.add_header("Authorization", f'MediaBrowser Token="{api_key}"')
-    req.add_header("Content-Type", "application/json")
-    if data is None:
-        req.add_header("Content-Length", "0")
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            raw = resp.read()
-            return json.loads(raw) if raw.strip() else {}
-    except Exception as exc:
-        if warn:
-            print(f"WARNING: Jellyfin API {method} {path} failed: {exc}", flush=True)
-        return None
-
-
 def _jellyfin_find_playlist_id(jellyfin_name: str, api_key: str) -> str | None:
     """Search for a Jellyfin playlist by exact name.
 
@@ -753,6 +711,7 @@ def sync_playlist(
     all_playlists: list[dict[str, Any]],
 ) -> bool:
     """Sync one playlist; returns True if new songs were downloaded this run."""
+    downloaded_new = False
     folder = MUSIC_DIR / OUTPUT_BASE / pl["folder"]
     folder.mkdir(parents=True, exist_ok=True)
     try:
@@ -897,6 +856,7 @@ def sync_playlist(
                 dl_rc = spotdl(
                     "download", *dl_urls, "--output", output_template, cwd=MUSIC_DIR
                 )
+                downloaded_new = True
             else:
                 dl_rc = 0
             if dl_rc != 0:
@@ -1007,6 +967,8 @@ def sync_playlist(
             flush=True,
         )
     still_missing = retry_missing_downloads(folder, due_ids, output_template)
+    if due_ids - still_missing:
+        downloaded_new = True
     if still_missing:
         # Deezer fallback — last resort for tracks absent from YouTube entirely.
         id_to_meta = {
@@ -1023,6 +985,7 @@ def sync_playlist(
             if deezer_fallback(sid, artist, name, folder):
                 print(f"  ✅ Deezer fallback SUCCESS: {sid}", flush=True)
                 still_missing.discard(sid)
+                downloaded_new = True
             else:
                 print(f"  ❌ Deezer fallback FAILED: {sid}", flush=True)
 
@@ -1063,7 +1026,7 @@ def sync_playlist(
         process_changed(lyrics_before, snapshot(folder))
     except Exception as exc:
         print(f"WARNING: lyrics processing failed ({type(exc).__name__})", flush=True)
-    return bool(added_ids)
+    return downloaded_new
 
 
 def main() -> None:

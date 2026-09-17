@@ -24,7 +24,9 @@ import mutagen
 import spotapi
 from shared import (
     deezer_fallback,
+    jellyfin_api,
     load_fallback_map,
+    load_jellyfin_api_key,
     load_retry_state,
     make_login,
     notify_exhausted_retries,
@@ -405,6 +407,7 @@ def main() -> None:
         return
     print(f"Spotify liked: {len(current_ids)}", flush=True)
 
+    downloaded_new = False
     songs, saved_ids = load_save_file()
     # WHY: only apply heuristic guard when totalCount was absent.  When Spotify
     # returned totalCount, get_liked_ids() already verified completeness via the
@@ -518,6 +521,7 @@ def main() -> None:
                         for sid in batch_missing_ids
                     ]
                     spotdl("download", *urls_missing, "--output", OUTPUT_TEMPLATE)
+                    downloaded_new = True
                 else:
                     print(
                         f"Batch {n}: all already on disk, download skipped", flush=True
@@ -588,6 +592,7 @@ def main() -> None:
             f"Fallback: {len(resolved)} pre-resolved URLs found, attempting hybrid download",
             flush=True,
         )
+        downloaded_new = True
         for sid, yt_url in resolved.items():
             spotify_url = f"https://open.spotify.com/track/{sid}"
             rc = spotdl(
@@ -610,6 +615,7 @@ def main() -> None:
             f"https://open.spotify.com/track/{sid}" for sid in sorted(retry_candidates)
         ]
         spotdl("download", *urls, "--output", OUTPUT_TEMPLATE)
+        downloaded_new = True
 
         # Deezer fallback — last resort when both YT Music and YouTube web fail.
         # Some tracks (e.g. Calluna by Quiescente) simply don't exist on YouTube
@@ -630,6 +636,7 @@ def main() -> None:
                 )
                 if deezer_fallback(sid, artist, name, MUSIC_DIR):
                     print(f"  ✅ Deezer fallback SUCCESS: {sid}", flush=True)
+                    downloaded_new = True
                 else:
                     print(f"  ❌ Deezer fallback FAILED: {sid}", flush=True)
 
@@ -677,6 +684,16 @@ def main() -> None:
         process_changed(lyrics_before, snapshot(MUSIC_DIR, exclude_playlists=True))
     except Exception as exc:
         print(f"WARNING: lyrics processing failed ({type(exc).__name__})", flush=True)
+
+    # WHY (2026-09-17): same fix as sync_playlists.py — RealtimeMonitor debounces
+    # per watched folder, so a run that downloads several songs in a row can
+    # starve the automatic scan indefinitely. Nudge it explicitly instead of
+    # relying on debounce timing or the 12-hour scheduled scan.
+    if downloaded_new:
+        api_key = load_jellyfin_api_key()
+        if api_key and jellyfin_api("POST", "/Library/Refresh", api_key) is not None:
+            print("Triggered Jellyfin library refresh (new songs downloaded)", flush=True)
+
     print("Done.", flush=True)
 
 
