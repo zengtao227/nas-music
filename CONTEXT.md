@@ -297,7 +297,7 @@ cat /tmp/query_lib.py | ssh nas "cat > /tmp/query_lib.py && sudo /usr/local/bin/
 重命名媒体库：
 ```bash
 curl -X POST 'http://localhost:8096/Library/VirtualFolders/Name?name=旧名&newName=新名&refreshLibrary=false' \
-  -H 'X-MediaBrowser-Token: <token>' -H 'Content-Length: 0'
+  -H 'Authorization: MediaBrowser Token="<token>"' -H 'Content-Length: 0'
 ```
 
 ## 组件

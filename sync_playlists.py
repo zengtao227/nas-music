@@ -507,7 +507,8 @@ def _jellyfin_api(
     url = f"{JELLYFIN_URL}{path}"
     data = json.dumps(body).encode() if body else None
     req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("X-MediaBrowser-Token", api_key)
+    # WHY: Jellyfin 12 disables the legacy X-MediaBrowser-Token header by default.
+    req.add_header("Authorization", f'MediaBrowser Token="{api_key}"')
     req.add_header("Content-Type", "application/json")
     if data is None:
         req.add_header("Content-Length", "0")
