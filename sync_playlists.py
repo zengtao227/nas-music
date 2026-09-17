@@ -607,6 +607,46 @@ def notify_jellyfin_refresh(jellyfin_id: str, api_key: str) -> None:
         print(f"Jellyfin refresh triggered: {jellyfin_id}", flush=True)
 
 
+def refresh_missing_track_images(jellyfin_id: str, api_key: str) -> None:
+    """Ask Jellyfin to extract embedded cover art for playlist tracks lacking one.
+
+    WHY: Jellyfin never extracted the embedded APIC art for playlist-folder
+    tracks (Liked Songs got theirs), so Finamp fell back to the folder-level
+    album image and a whole playlist showed one cover. A per-item FullRefresh
+    with ReplaceAllImages=false fills only the missing image (verified
+    2026-09-17 on Jellyfin 10.11.11). Tracks that already have art are skipped.
+    """
+    if not api_key:
+        return
+    result = _jellyfin_api(
+        "GET",
+        f"/Playlists/{jellyfin_id}/Items?UserId={JELLYFIN_MIA_USER_ID}",
+        api_key,
+    )
+    if result is None:
+        return
+    missing = [
+        item["Id"]
+        for item in result.get("Items", [])
+        if item.get("Id") and not item.get("ImageTags", {}).get("Primary")
+    ]
+    for item_id in missing:
+        _jellyfin_api(
+            "POST",
+            f"/Items/{item_id}/Refresh"
+            f"?MetadataRefreshMode=Default"
+            f"&ImageRefreshMode=FullRefresh"
+            f"&ReplaceAllImages=false"
+            f"&ReplaceAllMetadata=false",
+            api_key,
+        )
+    if missing:
+        print(
+            f"Jellyfin cover art refresh requested for {len(missing)} tracks",
+            flush=True,
+        )
+
+
 def rebuild_jellyfin_playlist(
     pl: dict,
     folder: pathlib.Path,
@@ -689,6 +729,7 @@ def rebuild_jellyfin_playlist(
     jellyfin_id = pl.get("jellyfin_id", "")
     if jellyfin_id:
         notify_jellyfin_refresh(jellyfin_id, api_key)
+        refresh_missing_track_images(jellyfin_id, api_key)
 
 
 def sync_playlist(
