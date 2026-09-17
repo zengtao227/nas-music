@@ -656,11 +656,20 @@ def main() -> None:
             f"Collision-satisfied: {len(collision_satisfied)} IDs covered by canonical owners",
             flush=True,
         )
-    tmp = MISSING_IDS_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(still_missing))
-    tmp.replace(MISSING_IDS_FILE)
+    content = json.dumps(still_missing)
+    # WHY: the file sits in the Jellyfin-watched library root; rewriting identical
+    # content every run made Jellyfin rescan the whole library every 5 minutes.
+    try:
+        unchanged = MISSING_IDS_FILE.read_text() == content
+    except OSError:
+        unchanged = False
+    if not unchanged:
+        tmp = MISSING_IDS_FILE.with_suffix(".tmp")
+        tmp.write_text(content)
+        tmp.replace(MISSING_IDS_FILE)
     print(
-        f"missing_ids.json: {len(still_missing)} unresolved songs written",
+        f"missing_ids.json: {len(still_missing)} unresolved songs"
+        f" ({'unchanged' if unchanged else 'written'})",
         flush=True,
     )
 
