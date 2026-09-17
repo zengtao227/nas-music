@@ -85,6 +85,12 @@ PLAYLISTS = [
         "folder": "katseye_animal",
         "jellyfin_name": "Katseye Animal",
     },
+    {
+        "id": "4fC8ytJHg1fU0ZzoTswuwG",
+        "name": "gamma_waves_40hz",
+        "folder": "gamma_waves_40hz",
+        "jellyfin_name": "Gamma Waves 40 Hz",
+    },
 ]
 
 
