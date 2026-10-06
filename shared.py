@@ -7,10 +7,14 @@ import path resolves correctly when scripts run as:
 """
 
 import datetime
+import fcntl
+import importlib.metadata
 import json
+import os
 import pathlib
 import re
 import subprocess
+import tempfile
 import urllib.parse
 import urllib.request
 from typing import Any, Callable
@@ -26,6 +30,159 @@ FALLBACK_MAP_FILE = MUSIC_DIR / "youtube_fallback_cache.json"
 TELEGRAM_CONFIG_FILE = MUSIC_DIR / ".telegram_config"
 JELLYFIN_URL = "http://192.168.68.68:8096"
 JELLYFIN_API_KEY_FILE = MUSIC_DIR / ".jellyfin_api_key"
+SPOTIFY_HASH_CACHE_FILE = MUSIC_DIR / ".spotify_query_hashes.json"
+SPOTIFY_REQUIRED_QUERIES = {"fetchPlaylist", "libraryV3", "fetchLibraryTracks"}
+SPOTIFY_HASH_PATTERN = re.compile(r'"([^"\n]+)","(query|mutation)","([a-f0-9]{64})"')
+
+
+def _spotify_hash_cache(
+    base: Any, original: Callable[..., Any], *, refresh: bool = False
+) -> None:
+    """Cache public query hashes while retaining SpotAPI's session and loader."""
+    from spotapi.types.alias import _Undefined
+
+    if base.js_pack is _Undefined:
+        base.get_session()
+    version = importlib.metadata.version("spotapi")
+    cache_path = SPOTIFY_HASH_CACHE_FILE
+    loaded = False
+    loading = False
+    try:
+        with cache_path.with_suffix(".lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            bundles: dict[str, str] = {}
+            try:
+                cached = json.loads(cache_path.read_text())
+                if cached["spotapi_version"] == version:
+                    for url, text in cached["bundles"].items():
+                        if isinstance(url, str) and isinstance(text, str):
+                            bundles[url] = text
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                pass
+            hashes = bundles.get(str(base.js_pack), "")
+            names = {match[0] for match in SPOTIFY_HASH_PATTERN.findall(hashes)}
+            if not refresh and SPOTIFY_REQUIRED_QUERIES <= names:
+                base.raw_hashes = hashes
+                print("Spotify query cache: hit", flush=True)
+                return
+
+            loading = True
+            original(base)
+            loading = False
+            loaded = True
+            entries = SPOTIFY_HASH_PATTERN.findall(str(base.raw_hashes))
+            if not SPOTIFY_REQUIRED_QUERIES <= {entry[0] for entry in entries}:
+                print("Spotify query cache: incomplete hashes; not saved", flush=True)
+                return
+            # WHY: preserve part_hash's existing query/mutation lookup format
+            # without retaining megabytes of JavaScript or any session tokens.
+            hashes = "\n".join(
+                json.dumps(list(entry), separators=(",", ":"))[1:-1]
+                for entry in entries
+            )
+            # WHY: Spotify served two bundle versions during a measured rollout.
+            # Retain both so alternating HTML responses do not force redownloads.
+            bundles.pop(str(base.js_pack), None)
+            bundles[str(base.js_pack)] = hashes
+            bundles = dict(list(bundles.items())[-2:])
+            payload = {"spotapi_version": version, "bundles": bundles}
+            temporary_path: pathlib.Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    dir=cache_path.parent,
+                    prefix=".spotify-query-",
+                    delete=False,
+                ) as temporary:
+                    temporary_path = pathlib.Path(temporary.name)
+                    json.dump(payload, temporary)
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
+                temporary_path.replace(cache_path)
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+            print(
+                f"Spotify query cache: refreshed ({str(base.js_pack).rsplit('/', 1)[-1]})",
+                flush=True,
+            )
+    except OSError as exc:
+        if loading:
+            raise
+        print(
+            f"Spotify query cache: unavailable ({type(exc).__name__}); using normal loader",
+            flush=True,
+        )
+        if not loaded:
+            original(base)
+
+
+def _install_spotify_hash_cache() -> None:
+    from spotapi.client import BaseClient
+    from spotapi.http.request import TLSClient
+
+    if getattr(BaseClient, "_nas_hash_cache_installed", False):
+        return
+    original = getattr(BaseClient, "get_sha256_hash", None)
+    original_post = getattr(TLSClient, "post", None)
+    if not callable(original) or not callable(original_post):
+        print(
+            "Spotify query cache: unsupported SpotAPI; normal loader retained",
+            flush=True,
+        )
+        return
+
+    def load(base: Any) -> None:
+        _spotify_hash_cache(base, original)
+        base.client._nas_hash_base = base
+
+    def post(client: Any, url: Any, **kwargs: Any) -> Any:
+        response = original_post(client, url, **kwargs)
+        if url != "https://api-partner.spotify.com/pathfinder/v1/query":
+            return response
+        body = response.response
+        errors = body.get("errors", []) if isinstance(body, dict) else []
+        errors = errors if isinstance(errors, list) else []
+        rejected = any(
+            isinstance(error, dict)
+            and (
+                error.get("message") == "PersistedQueryNotFound"
+                or (
+                    isinstance(error.get("extensions"), dict)
+                    and error["extensions"].get("code") == "PERSISTED_QUERY_NOT_FOUND"
+                )
+            )
+            for error in errors
+        )
+        params = kwargs.get("params")
+        base = getattr(client, "_nas_hash_base", None)
+        if not rejected or not isinstance(params, dict) or base is None:
+            return response
+        name = params.get("operationName")
+        if not isinstance(name, str) or name not in SPOTIFY_REQUIRED_QUERIES:
+            return response
+        try:
+            extensions = json.loads(params.get("extensions", ""))
+        except (ValueError, TypeError):
+            return response
+        if not isinstance(extensions, dict) or not isinstance(
+            extensions.get("persistedQuery"), dict
+        ):
+            return response
+        print(
+            "Spotify query cache: server rejected hash; refresh and retry once",
+            flush=True,
+        )
+        base.get_session()
+        _spotify_hash_cache(base, original, refresh=True)
+        retry_params = dict(params)
+        extensions["persistedQuery"]["sha256Hash"] = base.part_hash(name)
+        retry_params["extensions"] = json.dumps(extensions)
+        return original_post(client, url, **{**kwargs, "params": retry_params})
+
+    BaseClient.get_sha256_hash = load
+    TLSClient.post = post
+    BaseClient._nas_hash_cache_installed = True
 
 
 def load_jellyfin_api_key() -> str:
@@ -71,6 +228,7 @@ def jellyfin_api(
 
 def make_login() -> spotapi.Login:
     """Construct an authenticated spotapi Login from the on-disk sp_dc cookie."""
+    _install_spotify_hash_cache()
     sp_dc = SP_DC_FILE.read_text().strip()
     cfg = spotapi.Config(logger=spotapi.NoopLogger())
     dump = {"identifier": "mia", "password": "", "cookies": {"sp_dc": sp_dc}}

@@ -11,6 +11,8 @@ __pycache__/
 .telegram_config
 .spotify_playlist_discovery.json
 .spotify_playlist_discovery.json.bak
+.spotify_query_hashes.json
+.spotify_query_hashes.lock
 .playlist_retry_state.json
 .liked_retry_state.json
 .DS_Store
