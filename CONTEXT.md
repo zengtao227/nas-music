@@ -61,7 +61,7 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 `shared.make_login()` 在进程内安装一次 SpotAPI 公共 query hash 缓存，两个同步脚本及每个歌单客户端共用 `/music/.spotify_query_hashes.json`。缓存只保存从公开 JS 提取的 query/mutation 名称和 SHA-256，不保存 cookie、access token 或 client token。
 
 - 每个客户端仍读取 Spotify 首页和当前 JS URL，登录逻辑照常运行。
-- 按完整 JS URL 和 SpotAPI 版本匹配、三个必需 query hash 均有效时，跳过主 JS 和所有分块下载；缓存命中不改写文件。同一文件保留最近两个 JS 版本，避免 Spotify 发布期间不同首页返回旧/新版本造成反复下载（2026-10-06 隔离测量实测）。
+- 按完整 JS URL 和 SpotAPI 版本匹配、三个必需 query hash 均有效时，跳过主 JS 和所有分块下载；缓存命中不改写文件。同一文件保留最近八个 JS 版本：线上实测 Spotify 在 15 分钟内轮流返回四个不同版本，最初只保留两个时它们互相挤掉，四轮里重新下载了五次（2026-10-06）。
 - 冷启动、JS 更版、缓存损坏或缺项时，复用 SpotAPI 原下载与提取入口。并发首次加载由文件锁串行化，写入使用同目录临时文件和原子替换。
 - 缓存读写失败时正常下载；写入失败不影响已经获得的查询数据。
 - 仅当三个只读查询明确返回 `PersistedQueryNotFound` 时，刷新并重试一次；普通网络或认证错误仍按 SpotAPI 原逻辑处理。
@@ -69,7 +69,9 @@ Cloudflare Tunnel → https://music.zengsg.dpdns.org
 
 上线前隔离容器的只读列表查询测量（RX+TX，2026-10-06）：两轮无缓存为 15.564MB / 15.627MB；最终两轮缓存全命中为 0.777MB / 0.779MB，查询条目数一致，减少约 95%。按每五分钟运行、30 天推算约 135GB → 6.7GB/月，仅指这组列表查询，不包括新增音乐下载、Finamp 外网播放或其他 NAS 服务。首次建缓存、JS 发布切换和网络重试会增加少量流量，月度数字为推算而非整月实测。
 
-部署备份：`/volume1/homes/Mia/Music/.backups/spotify-query-cache-20261006T124534Z/shared.py`。
+线上实测（NAS 网卡 eth1 接收计数器，每轮同步前后差值，2026-10-06）：改动前连续 8 轮均为 16.1MB；只保留两个版本时 3 轮为 2.88 / 2.93 / 4.77MB（每轮重新下载 1–2 次 JS，每次约 1.9MB）；保留八个版本后连续 4 轮缓存全命中，为 1.57 / 0.98 / 0.99 / 1.00MB。按每轮约 1MB 推算约 9GB/月，Spotify 每出现一个新 JS 版本会多下载一次约 1.9MB。
+
+部署备份：`/volume1/homes/Mia/Music/.backups/spotify-query-cache-20261006T124534Z/shared.py`（缓存上线前）、`.backups/spotify-query-cache-retain8-20261006T131501Z/shared.py`（保留两个版本的那一版）。
 
 ### Liked Songs（每 5 分钟）
 

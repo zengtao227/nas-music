@@ -55,6 +55,13 @@ class SpotifyHashCacheTest(unittest.TestCase):
         shared._spotify_hash_cache(self.base, self.loader)
         self.assertEqual(self.loader.call_count, 2)
 
+    def test_four_rotating_versions_do_not_evict_each_other(self) -> None:
+        urls = [f"https://open.spotifycdn.com/web-player.v{i}.js" for i in range(4)]
+        for url in urls + urls:
+            self.base.js_pack = url
+            shared._spotify_hash_cache(self.base, self.loader)
+        self.assertEqual(self.loader.call_count, 4)
+
     def test_separate_clients_share_cache(self) -> None:
         shared._spotify_hash_cache(self.base, self.loader)
         second = SimpleNamespace(js_pack=self.base.js_pack, raw_hashes=None)

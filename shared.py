@@ -80,11 +80,11 @@ def _spotify_hash_cache(
                 json.dumps(list(entry), separators=(",", ":"))[1:-1]
                 for entry in entries
             )
-            # WHY: Spotify served two bundle versions during a measured rollout.
-            # Retain both so alternating HTML responses do not force redownloads.
+            # WHY: Spotify rotated four bundle versions within 15 minutes in
+            # production (2026-10-06); retaining two made them evict each other.
             bundles.pop(str(base.js_pack), None)
             bundles[str(base.js_pack)] = hashes
-            bundles = dict(list(bundles.items())[-2:])
+            bundles = dict(list(bundles.items())[-8:])
             payload = {"spotapi_version": version, "bundles": bundles}
             temporary_path: pathlib.Path | None = None
             try:
